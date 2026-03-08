@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const morgan = require("morgan");
+const connectDb = require("./config/db");
 
 const profileRoutes = require("./routes/profileRoutes");
 const dashboardRoutes = require("./routes/dashboardRoutes");
@@ -16,6 +17,19 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(morgan("dev"));
+
+app.use(async (req, res, next) => {
+  if (req.path === "/health") {
+    return next();
+  }
+
+  try {
+    await connectDb();
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+});
 
 app.get("/health", (req, res) => {
   res.json({

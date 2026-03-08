@@ -35,7 +35,17 @@ const getGoogleEnv = () => {
   return { clientId, clientSecret, redirectUri };
 };
 
-const getFrontendAppointmentsUrl = () => `${process.env.FRONTEND_URL || "http://localhost:5173"}/insurance/appointments`;
+const resolveFrontendBaseUrl = () => {
+  const explicit = String(process.env.FRONTEND_URL || "").trim();
+  if (explicit) return explicit.replace(/\/+$/, "");
+
+  const vercelUrl = String(process.env.VERCEL_URL || "").trim();
+  if (vercelUrl) return `https://${vercelUrl.replace(/\/+$/, "")}`;
+
+  return "http://localhost:5173";
+};
+
+const getFrontendAppointmentsUrl = () => `${resolveFrontendBaseUrl()}/insurance/appointments`;
 
 const postGoogleToken = async (params) => {
   const response = await fetch("https://oauth2.googleapis.com/token", {
