@@ -172,26 +172,26 @@ const listCreators = asyncHandler(async (req, res) => {
 });
 
 const upsertCreator = asyncHandler(async (req, res) => {
-  const { name, phone, email, notes, tags, creatorName, tiktokUsername, country, manager, partnerRevenue, partnerRevenueDate } = req.body;
+  const { name, phone, notes, tags, creatorName, tiktokUsername, country, manager, partnerRevenue, partnerRevenueDate } = req.body;
+  const normalizedUsername = normalizeUsername(tiktokUsername);
 
   const identityFilters = [];
-  if (email) identityFilters.push({ email });
   if (phone) identityFilters.push({ phone });
-  if (tiktokUsername) identityFilters.push({ "tiktokData.tiktokUsername": tiktokUsername });
+  if (normalizedUsername) identityFilters.push({ "tiktokData.tiktokUsername": normalizedUsername });
 
   let profile = identityFilters.length ? await Profile.findOne({ $or: identityFilters }) : null;
 
   if (!profile) {
+    const resolvedName = String(name || creatorName || normalizedUsername || "TikTok Partner").trim();
     profile = await Profile.create({
-      name: name || creatorName,
+      name: resolvedName,
       phone,
-      email,
       notes,
       tags,
       moduleMembership: ["tiktok"],
       tiktokData: {
-        creatorName: creatorName || name,
-        tiktokUsername,
+        creatorName: creatorName || resolvedName,
+        tiktokUsername: normalizedUsername,
         country,
         manager,
         partnerRevenue: hasValue(partnerRevenue) ? toNumberOr(partnerRevenue, 0) : 0,
@@ -203,15 +203,14 @@ const upsertCreator = asyncHandler(async (req, res) => {
     if (!profile.moduleMembership.includes("tiktok")) {
       profile.moduleMembership.push("tiktok");
     }
-    profile.name = name || profile.name;
+    profile.name = name || creatorName || profile.name;
     profile.phone = phone || profile.phone;
-    profile.email = email || profile.email;
     profile.notes = notes || profile.notes;
     profile.tags = tags || profile.tags;
     profile.tiktokData = {
       ...profile.tiktokData?.toObject?.(),
       creatorName: creatorName || profile.tiktokData?.creatorName || profile.name,
-      tiktokUsername: tiktokUsername || profile.tiktokData?.tiktokUsername,
+      tiktokUsername: normalizedUsername || profile.tiktokData?.tiktokUsername,
       country: country || profile.tiktokData?.country,
       manager: manager || profile.tiktokData?.manager,
       partnerRevenue: hasValue(partnerRevenue) ? toNumberOr(partnerRevenue, 0) : profile.tiktokData?.partnerRevenue || 0,
@@ -229,6 +228,17 @@ const upsertCreator = asyncHandler(async (req, res) => {
   });
 
   res.status(201).json({ success: true, data: profile });
+});
+
+const listIdealUsernames = asyncHandler(async (req, res) => {
+  const users = await IdealUser.find({})
+    .select("username")
+    .sort({ updatedAt: -1, createdAt: -1 })
+    .limit(1000)
+    .lean();
+
+  const usernames = [...new Set(users.map((user) => normalizeUsername(user.username)).filter(Boolean))];
+  res.json({ success: true, data: usernames });
 });
 
 const addDailyData = asyncHandler(async (req, res) => {
@@ -371,6 +381,7 @@ const addIdealUser = asyncHandler(async (req, res) => {
 module.exports = {
   listCreators,
   upsertCreator,
+  listIdealUsernames,
   addDailyData,
   listDailyData,
   sendMessage,

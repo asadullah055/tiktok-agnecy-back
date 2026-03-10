@@ -8,7 +8,8 @@ const {
   listMessages,
   messageDeliveryStats,
   listIdealUsers,
-  addIdealUser
+  addIdealUser,
+  listIdealUsernames
 } = require("../controllers/tiktokController");
 
 const router = express.Router();
@@ -18,5 +19,6 @@ router.route("/daily-data").get(listDailyData).post(addDailyData);
 router.route("/messages").get(listMessages).post(sendMessage);
 router.get("/messages/stats", messageDeliveryStats);
 router.route("/ideal-users").get(listIdealUsers).post(addIdealUser);
+router.get("/ideal-usernames", listIdealUsernames);
 
 module.exports = router;
