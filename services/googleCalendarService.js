@@ -86,6 +86,47 @@ const fetchGoogleUserEmail = async (accessToken) => {
   return data.email || "";
 };
 
+const copyConnectionPayload = (connection = {}, overrides = {}) => ({
+  googleAccountEmail: connection.googleAccountEmail || undefined,
+  accessToken: connection.accessToken || undefined,
+  refreshToken: connection.refreshToken || undefined,
+  tokenType: connection.tokenType || undefined,
+  scope: connection.scope || undefined,
+  expiresAt: connection.expiresAt || undefined,
+  ...overrides
+});
+
+const resolveConnectionForKey = async (connectionKey) => {
+  const key = String(connectionKey || "").trim();
+  if (!key) {
+    return { connection: null, fromFallback: false };
+  }
+
+  const exact = await GoogleCalendarConnection.findOne({ connectionKey: key });
+  if (exact) {
+    return { connection: exact, fromFallback: false };
+  }
+
+  // Legacy recovery: alias the most recently active Google Calendar connection
+  // to requested workspace key so workspaceKey-based flows continue to work.
+  const candidates = await GoogleCalendarConnection.find({ accessToken: { $exists: true, $ne: "" } })
+    .sort({ updatedAt: -1 })
+    .limit(1);
+
+  if (!candidates.length) {
+    return { connection: null, fromFallback: false };
+  }
+
+  const source = candidates[0];
+  const aliased = await GoogleCalendarConnection.findOneAndUpdate(
+    { connectionKey: key },
+    { $set: copyConnectionPayload(source) },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+
+  return { connection: aliased, fromFallback: true };
+};
+
 const refreshGoogleAccessToken = async (connection) => {
   if (!connection?.refreshToken) {
     throw new Error("Google Calendar token expired and refresh token is missing. Reconnect Google Calendar.");
@@ -216,7 +257,7 @@ const getGoogleCalendarConnectionStatus = async (connectionKey) => {
     return { connected: false };
   }
 
-  const connection = await GoogleCalendarConnection.findOne({ connectionKey: key });
+  const { connection } = await resolveConnectionForKey(key);
   if (!connection?.accessToken) {
     return { connected: false };
   }
@@ -234,7 +275,7 @@ const listGoogleCalendarAppointments = async ({ connectionKey, today = false, ma
     throw new Error("connectionKey is required");
   }
 
-  const connection = await GoogleCalendarConnection.findOne({ connectionKey: key });
+  const { connection } = await resolveConnectionForKey(key);
   if (!connection) {
     throw new Error("Google Calendar is not connected for this user.");
   }
