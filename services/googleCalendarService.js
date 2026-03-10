@@ -281,9 +281,8 @@ const listGoogleCalendarAppointments = async ({ connectionKey, today = false, ma
   }
 
   const accessToken = await getValidAccessToken(connection);
-  const now = new Date();
-  const startOfDay = new Date(now);
-  startOfDay.setHours(0, 0, 0, 0);
+  const nowTimestamp = Date.now();
+  const now = new Date(nowTimestamp);
   const endOfDay = new Date(now);
   endOfDay.setHours(23, 59, 59, 999);
 
@@ -294,7 +293,8 @@ const listGoogleCalendarAppointments = async ({ connectionKey, today = false, ma
     maxResults: String(toNumberOr(maxResults, 250))
   });
 
-  params.set("timeMin", (today ? startOfDay : now).toISOString());
+  // Past events are always excluded from appointment responses.
+  params.set("timeMin", now.toISOString());
   if (today) {
     params.set("timeMax", endOfDay.toISOString());
   }
@@ -312,7 +312,13 @@ const listGoogleCalendarAppointments = async ({ connectionKey, today = false, ma
   const filteredItems = bookedOnly === false || String(bookedOnly).toLowerCase() === "false"
     ? items
     : items.filter(isBookedGoogleAppointment);
-  return filteredItems.map(normalizeGoogleEvent);
+
+  return filteredItems
+    .map(normalizeGoogleEvent)
+    .filter((event) => {
+      const timestamp = new Date(event.scheduledFor).getTime();
+      return Number.isFinite(timestamp) && timestamp >= nowTimestamp;
+    });
 };
 
 const disconnectGoogleCalendar = async (connectionKey) => {

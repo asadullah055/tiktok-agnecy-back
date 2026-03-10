@@ -218,7 +218,7 @@ const getDatabaseUpcomingAppointments = async (limit = 7) => {
 };
 
 const getDatabaseTodayAppointments = async (limit = 10) => {
-  const start = dayjs().startOf("day").toDate();
+  const start = new Date();
   const end = dayjs().endOf("day").toDate();
 
   const appointments = await Appointment.find({
