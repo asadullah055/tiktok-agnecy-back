@@ -35,7 +35,8 @@ const sendTelegramMessage = async ({ chatId, text, replyToMessageId }) => {
   return telegramRequest("sendMessage", {
     chat_id: chatId,
     text: String(text || "").trim() || "I could not generate a response.",
-    reply_to_message_id: replyToMessageId || undefined
+    reply_to_message_id: replyToMessageId || undefined,
+    allow_sending_without_reply: replyToMessageId ? true : undefined
   });
 };
 

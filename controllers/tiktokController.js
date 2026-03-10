@@ -5,6 +5,8 @@ const IdealUser = require("../models/IdealUser");
 const asyncHandler = require("../middlewares/asyncHandler");
 const { logActivity } = require("../services/activityService");
 
+const USD_PER_DIAMOND = 0.005;
+const MAX_IDEAL_USER_DAYS = 30;
 const hasValue = (value) => value !== undefined && value !== null && value !== "";
 const toNumberOr = (value, fallback = 0) => {
   const parsed = Number(value);
@@ -18,6 +20,133 @@ const normalizeDeliveryStatus = (value) => {
 
   const normalized = String(value).trim().toLowerCase().replace(/\s+/g, "_");
   return normalized === "failed" ? "delivery_failed" : normalized;
+};
+const escapeRegExp = (value) => String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const normalizeUsername = (value) => String(value || "").trim().replace(/^@/, "").trim();
+const toPositiveNumber = (value) => Math.max(0, toNumberOr(value, 0));
+const toPositiveInteger = (value, fallback = 0) => Math.max(0, Math.round(hasValue(value) ? toNumberOr(value, fallback) : fallback));
+const calculateDiamondsFromIncome = (income) => Math.max(0, Math.round(toPositiveNumber(income) / USD_PER_DIAMOND));
+const calculateIncomeFromDiamonds = (diamonds) => Math.max(0, Math.round(toPositiveNumber(diamonds) * USD_PER_DIAMOND));
+
+const normalizeMoneyPair = ({ income, diamonds }) => {
+  const hasIncome = hasValue(income);
+  const hasDiamonds = hasValue(diamonds);
+
+  if (!hasIncome && !hasDiamonds) {
+    return { income: 0, diamonds: 0 };
+  }
+
+  if (hasIncome && !hasDiamonds) {
+    const normalizedIncome = toPositiveNumber(income);
+    return {
+      income: normalizedIncome,
+      diamonds: calculateDiamondsFromIncome(normalizedIncome)
+    };
+  }
+
+  if (!hasIncome && hasDiamonds) {
+    const normalizedDiamonds = toPositiveNumber(diamonds);
+    return {
+      income: calculateIncomeFromDiamonds(normalizedDiamonds),
+      diamonds: normalizedDiamonds
+    };
+  }
+
+  return {
+    income: toPositiveNumber(income),
+    diamonds: toPositiveNumber(diamonds)
+  };
+};
+
+const sanitizeDateKey = (value) => {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return "";
+
+  return parsed.toISOString().slice(0, 10);
+};
+
+const normalizeIdealUserDays = (rawDays) => {
+  if (!Array.isArray(rawDays)) return [];
+
+  const byDate = new Map();
+  rawDays.forEach((day) => {
+    const date = sanitizeDateKey(day?.date);
+    if (!date) return;
+    byDate.set(date, {
+      date,
+      ...normalizeMoneyPair({
+        income: day?.income,
+        diamonds: day?.diamonds
+      })
+    });
+  });
+
+  return [...byDate.values()]
+    .sort((left, right) => right.date.localeCompare(left.date))
+    .slice(0, MAX_IDEAL_USER_DAYS);
+};
+
+const getIdealUserTotals = (payload, days) => {
+  const hasExplicitTotals =
+    hasValue(payload?.totalIncome) ||
+    hasValue(payload?.revenew) ||
+    hasValue(payload?.totalDiamonds) ||
+    hasValue(payload?.diamonds);
+
+  if (hasExplicitTotals) {
+    return normalizeMoneyPair({
+      income: payload?.totalIncome ?? payload?.revenew,
+      diamonds: payload?.totalDiamonds ?? payload?.diamonds
+    });
+  }
+
+  return days.reduce(
+    (sum, day) => ({
+      income: sum.income + toPositiveNumber(day.income),
+      diamonds: sum.diamonds + toPositiveNumber(day.diamonds)
+    }),
+    { income: 0, diamonds: 0 }
+  );
+};
+
+const sumIdealUserDays = (days) =>
+  days.reduce(
+    (sum, day) => ({
+      income: sum.income + toPositiveNumber(day?.income),
+      diamonds: sum.diamonds + toPositiveNumber(day?.diamonds)
+    }),
+    { income: 0, diamonds: 0 }
+  );
+
+const normalizeIdealUserResponse = (user = {}) => {
+  const days = Array.isArray(user.days)
+    ? user.days.map((day) => ({
+        date: sanitizeDateKey(day?.date),
+        income: toPositiveNumber(day?.income),
+        diamonds: toPositiveNumber(day?.diamonds)
+      }))
+    : [];
+  const safeDays = days.filter((day) => day.date).sort((left, right) => right.date.localeCompare(left.date));
+  const latestDays = safeDays.slice(0, MAX_IDEAL_USER_DAYS);
+  const totalIncome = toPositiveNumber(user.totalIncome ?? user.revenew);
+  const totalDiamonds = toPositiveNumber(user.totalDiamonds ?? user.diamonds);
+
+  return {
+    ...user,
+    id: String(user._id || user.id || ""),
+    name: String(user.name || "").trim(),
+    username: normalizeUsername(user.username),
+    daysCount: toPositiveInteger(user.daysCount, days.length || MAX_IDEAL_USER_DAYS),
+    totalIncome,
+    totalDiamonds,
+    revenew: totalIncome,
+    diamonds: totalDiamonds,
+    days: latestDays
+  };
 };
 
 const getDeliveryStatusFilterValues = (value) => {
@@ -195,30 +324,48 @@ const messageDeliveryStats = asyncHandler(async (req, res) => {
 });
 
 const listIdealUsers = asyncHandler(async (req, res) => {
-  const users = await IdealUser.find({}).sort({ createdAt: -1 }).limit(500);
-  res.json({ success: true, data: users });
+  const users = await IdealUser.find({}).sort({ updatedAt: -1, createdAt: -1 }).limit(500).lean();
+  res.json({ success: true, data: users.map((user) => normalizeIdealUserResponse(user)) });
 });
 
 const addIdealUser = asyncHandler(async (req, res) => {
-  const username = String(req.body?.username || "").trim();
+  const name = String(req.body?.name || "").trim();
+  const username = normalizeUsername(req.body?.username);
+
+  if (!name) {
+    res.status(400);
+    throw new Error("Name is required");
+  }
+
   if (!username) {
     res.status(400);
     throw new Error("Username is required");
   }
 
-  const user = await IdealUser.create({
-    username,
-    diamonds: toNumberOr(req.body?.diamonds, 0),
-    revenew: toNumberOr(req.body?.revenew, 0)
+  const days = normalizeIdealUserDays(req.body?.days);
+  const totals = getIdealUserTotals(req.body, days);
+  const existingUser = await IdealUser.findOne({
+    username: new RegExp(`^${escapeRegExp(username)}$`, "i")
   });
+
+  const user = existingUser || new IdealUser();
+  user.name = name;
+  user.username = username;
+  user.daysCount = toPositiveInteger(req.body?.daysCount, days.length || MAX_IDEAL_USER_DAYS);
+  user.totalIncome = totals.income;
+  user.totalDiamonds = totals.diamonds;
+  user.revenew = totals.income;
+  user.diamonds = totals.diamonds;
+  user.days = days;
+  await user.save();
 
   await logActivity({
     type: "ideal_user_saved",
     module: "tiktok",
-    message: `Ideal user saved: ${user.username}`
+    message: `Ideal creator saved: ${user.name} (@${user.username})`
   });
 
-  res.status(201).json({ success: true, data: user });
+  res.status(existingUser ? 200 : 201).json({ success: true, data: normalizeIdealUserResponse(user.toObject()) });
 });
 
 module.exports = {

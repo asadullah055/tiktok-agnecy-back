@@ -135,7 +135,9 @@ const processTelegramUpdate = async (update) => {
     return;
   }
 
-  const reply = await generateTelegramAssistantReply(userText);
+  const reply = await generateTelegramAssistantReply(userText, {
+    displayName: integration.telegramDisplayName || resolveDisplayName(message.from)
+  });
   await sendTelegramMessage({
     chatId: message.chatId,
     replyToMessageId: message.messageId,
@@ -149,21 +151,37 @@ const telegramWebhook = async (req, res) => {
     return;
   }
 
-  res.json({ success: true });
-  processTelegramUpdate(req.body).catch(async (error) => {
+  try {
+    // Await processing so serverless runtimes do not terminate before reply is sent.
+    await processTelegramUpdate(req.body);
+  } catch (error) {
+    console.error("Telegram webhook processing failed:", error);
+
     const fallbackMessage = extractTelegramMessage(req.body);
+    const fallbackText = `Could not process your request: ${error.message || "Unknown error"}`;
+
     if (fallbackMessage?.chatId) {
       try {
         await sendTelegramMessage({
           chatId: fallbackMessage.chatId,
           replyToMessageId: fallbackMessage.messageId,
-          text: `Could not process your request: ${error.message || "Unknown error"}`
+          text: fallbackText
         });
-      } catch {
-        // Best effort fallback, ignore nested errors.
+      } catch (nestedError) {
+        console.error("Telegram fallback reply failed:", nestedError);
+        try {
+          await sendTelegramMessage({
+            chatId: fallbackMessage.chatId,
+            text: fallbackText
+          });
+        } catch (finalError) {
+          console.error("Telegram fallback without reply-to also failed:", finalError);
+        }
       }
     }
-  });
+  }
+
+  res.json({ success: true });
 };
 
 const getTelegramIntegrationStatus = asyncHandler(async (req, res) => {
