@@ -83,7 +83,6 @@ const processTelegramUpdate = async (update) => {
     if (linkResult?.linked) {
       await sendTelegramMessage({
         chatId: message.chatId,
-        replyToMessageId: message.messageId,
         text: "Telegram account linked successfully. You can now ask CRM questions in natural language."
       });
       return;
@@ -91,7 +90,6 @@ const processTelegramUpdate = async (update) => {
 
     await sendTelegramMessage({
       chatId: message.chatId,
-      replyToMessageId: message.messageId,
       text: "Link code invalid or expired. Generate a new link code from Settings page and use /start link_<code>."
     });
     return;
@@ -105,7 +103,6 @@ const processTelegramUpdate = async (update) => {
   if (!integration) {
     await sendTelegramMessage({
       chatId: message.chatId,
-      replyToMessageId: message.messageId,
       text: "This Telegram chat is not linked yet. Please generate a link code from Settings and send /start link_<code>."
     });
     return;
@@ -129,7 +126,6 @@ const processTelegramUpdate = async (update) => {
   if (!userText) {
     await sendTelegramMessage({
       chatId: message.chatId,
-      replyToMessageId: message.messageId,
       text: "Please send a text or voice message."
     });
     return;
@@ -140,7 +136,6 @@ const processTelegramUpdate = async (update) => {
   });
   await sendTelegramMessage({
     chatId: message.chatId,
-    replyToMessageId: message.messageId,
     text: reply
   });
 };
@@ -164,7 +159,6 @@ const telegramWebhook = async (req, res) => {
       try {
         await sendTelegramMessage({
           chatId: fallbackMessage.chatId,
-          replyToMessageId: fallbackMessage.messageId,
           text: fallbackText
         });
       } catch (nestedError) {
