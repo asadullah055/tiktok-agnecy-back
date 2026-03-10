@@ -13,6 +13,10 @@ const { getFixedExpenseSnapshot } = require("./fixedExpenseService");
 const { listGoogleCalendarAppointments } = require("./googleCalendarService");
 const { isOpenAiConfigured, chatWithOpenAi } = require("./openAiService");
 
+const TELEGRAM_DISPLAY_TIME_ZONE = String(
+  process.env.TELEGRAM_DISPLAY_TIME_ZONE || process.env.APP_TIME_ZONE || "Asia/Dhaka"
+).trim();
+
 const normalizeText = (value) => String(value || "").toLowerCase().trim();
 
 const includesAny = (text, keywords) => keywords.some((key) => text.includes(key));
@@ -64,8 +68,55 @@ const isHelpRequest = (rawText) => {
   return ["/help", "help", "menu", "commands"].includes(text);
 };
 
+const formatTimeZoneDateTime = (value, options = {}) => {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+
+  const includeDate = options.includeDate !== false;
+  const includeYear = Boolean(options.includeYear);
+  const timeOnly = Boolean(options.timeOnly);
+  const formatterOptions = {
+    timeZone: TELEGRAM_DISPLAY_TIME_ZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true
+  };
+
+  if (!timeOnly && includeDate) {
+    formatterOptions.month = "short";
+    formatterOptions.day = "numeric";
+    if (includeYear) {
+      formatterOptions.year = "numeric";
+    }
+  }
+
+  try {
+    return new Intl.DateTimeFormat("en-US", formatterOptions).format(date);
+  } catch {
+    return new Intl.DateTimeFormat("en-US", {
+      ...formatterOptions,
+      timeZone: "UTC"
+    }).format(date);
+  }
+};
+
+const getTimeZoneHour = () => {
+  try {
+    const value = new Intl.DateTimeFormat("en-US", {
+      timeZone: TELEGRAM_DISPLAY_TIME_ZONE,
+      hour: "numeric",
+      hour12: false
+    }).format(new Date());
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) ? parsed : dayjs().hour();
+  } catch {
+    return dayjs().hour();
+  }
+};
+
 const getGreetingByTime = () => {
-  const hour = dayjs().hour();
+  const hour = getTimeZoneHour();
   if (hour < 12) return "Good morning";
   if (hour < 17) return "Good afternoon";
   return "Good evening";
@@ -601,7 +652,7 @@ const formatUpcomingAppointments = (rows, snapshot = {}) => {
     `Upcoming appointments (${sourceLabel}):`,
     ...rows.map((row, index) => {
       const phonePart = row.phone && row.phone !== "-" ? ` (${row.phone})` : "";
-      return `${index + 1}. ${row.customer}${phonePart} - ${dayjs(row.when).format("MMM DD, hh:mm A")}`;
+      return `${index + 1}. ${row.customer}${phonePart} - ${formatTimeZoneDateTime(row.when)}`;
     })
   ].join("\n");
 };
@@ -618,7 +669,7 @@ const formatTodayAppointments = (rows, snapshot = {}) => {
     `Today's appointments (${sourceLabel}):`,
     ...rows.map((row, index) => {
       const phonePart = row.phone && row.phone !== "-" ? ` (${row.phone})` : "";
-      return `${index + 1}. ${row.customer}${phonePart} - ${dayjs(row.when).format("hh:mm A")}`;
+      return `${index + 1}. ${row.customer}${phonePart} - ${formatTimeZoneDateTime(row.when, { timeOnly: true })}`;
     })
   ].join("\n");
 };
@@ -644,7 +695,7 @@ const formatAppointmentCheck = (snapshot) => {
   if (nextAppointment) {
     const phonePart = nextAppointment.phone && nextAppointment.phone !== "-" ? ` (${nextAppointment.phone})` : "";
     lines.push(
-      `- Next: ${nextAppointment.customer}${phonePart} at ${dayjs(nextAppointment.when).format("MMM DD, hh:mm A")}`
+      `- Next: ${nextAppointment.customer}${phonePart} at ${formatTimeZoneDateTime(nextAppointment.when)}`
     );
   }
 
@@ -856,7 +907,25 @@ const resolvePendingActionReply = async (pendingAction, snapshot, options = {}) 
   return "";
 };
 
-const formatContextDate = (value) => (value ? dayjs(value).format("YYYY-MM-DD HH:mm") : null);
+const formatContextDate = (value) => {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+
+  try {
+    return new Intl.DateTimeFormat("sv-SE", {
+      timeZone: TELEGRAM_DISPLAY_TIME_ZONE,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false
+    }).format(date);
+  } catch {
+    return dayjs(value).format("YYYY-MM-DD HH:mm");
+  }
+};
 
 const buildContextText = (snapshot) =>
   JSON.stringify(
