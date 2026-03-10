@@ -15,7 +15,14 @@ const telegramIntegrationSchema = new mongoose.Schema(
     telegramUsername: { type: String, trim: true },
     telegramDisplayName: { type: String, trim: true },
     linkedAt: { type: Date },
-    lastInteractionAt: { type: Date }
+    lastInteractionAt: { type: Date },
+    conversationState: {
+      lastIntent: { type: String, trim: true, default: "" },
+      pendingAction: { type: String, trim: true, default: "" },
+      lastUserText: { type: String, trim: true, default: "" },
+      lastAssistantText: { type: String, trim: true, default: "" },
+      updatedAt: { type: Date }
+    }
   },
   { timestamps: true }
 );

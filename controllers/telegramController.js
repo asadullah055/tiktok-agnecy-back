@@ -8,13 +8,24 @@ const {
   sendTelegramMessage,
   setTelegramWebhook
 } = require("../services/telegramBotService");
-const { generateTelegramAssistantReply, buildMetricsSnapshot } = require("../services/telegramInsightsService");
+const {
+  generateTelegramAssistantReply,
+  generateTelegramAssistantTurn,
+  buildMetricsSnapshot
+} = require("../services/telegramInsightsService");
 
 const LINK_CODE_TTL_MINUTES = Number(process.env.TELEGRAM_LINK_CODE_TTL_MINUTES || 15);
 
 const getTelegramBotUsername = () => String(process.env.TELEGRAM_BOT_USERNAME || "").replace(/^@/, "").trim();
 
 const generateLinkCode = () => `ET-${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
+const createEmptyConversationState = () => ({
+  lastIntent: "",
+  pendingAction: "",
+  lastUserText: "",
+  lastAssistantText: "",
+  updatedAt: null
+});
 
 const extractStartPayload = (text) => {
   const value = String(text || "").trim();
@@ -59,6 +70,7 @@ const linkTelegramChatWithCode = async (message, rawPayload) => {
   integration.telegramDisplayName = resolveDisplayName(message.from);
   integration.linkedAt = now;
   integration.lastInteractionAt = now;
+  integration.conversationState = createEmptyConversationState();
   integration.linkCode = undefined;
   integration.linkCodeExpiresAt = undefined;
   await integration.save();
@@ -108,9 +120,6 @@ const processTelegramUpdate = async (update) => {
     return;
   }
 
-  integration.lastInteractionAt = new Date();
-  await integration.save();
-
   let userText = message.text;
   const voiceFileId = message.voiceFileId;
 
@@ -124,6 +133,8 @@ const processTelegramUpdate = async (update) => {
   }
 
   if (!userText) {
+    integration.lastInteractionAt = new Date();
+    await integration.save();
     await sendTelegramMessage({
       chatId: message.chatId,
       text: "Please send a text or voice message."
@@ -131,12 +142,25 @@ const processTelegramUpdate = async (update) => {
     return;
   }
 
-  const reply = await generateTelegramAssistantReply(userText, {
-    displayName: integration.telegramDisplayName || resolveDisplayName(message.from)
+  const assistantTurn = await generateTelegramAssistantTurn(userText, {
+    displayName: integration.telegramDisplayName || resolveDisplayName(message.from),
+    conversationState: integration.conversationState || createEmptyConversationState(),
+    connectionKey: integration.workspaceKey
   });
+
+  integration.lastInteractionAt = new Date();
+  integration.conversationState = {
+    ...createEmptyConversationState(),
+    ...(assistantTurn?.conversationState || {}),
+    updatedAt: assistantTurn?.conversationState?.updatedAt
+      ? new Date(assistantTurn.conversationState.updatedAt)
+      : new Date()
+  };
+  await integration.save();
+
   await sendTelegramMessage({
     chatId: message.chatId,
-    text: reply
+    text: assistantTurn?.reply || "I could not generate a response."
   });
 };
 
@@ -241,7 +265,8 @@ const generateTelegramLinkCode = asyncHandler(async (req, res) => {
         telegramUserId: null,
         telegramUsername: "",
         telegramDisplayName: "",
-        linkedAt: null
+        linkedAt: null,
+        conversationState: createEmptyConversationState()
       }
     },
     { upsert: true, new: true, setDefaultsOnInsert: true }
@@ -280,7 +305,8 @@ const unlinkTelegramIntegration = asyncHandler(async (req, res) => {
         telegramUserId: null,
         telegramUsername: "",
         telegramDisplayName: "",
-        linkedAt: null
+        linkedAt: null,
+        conversationState: createEmptyConversationState()
       }
     },
     { upsert: true, new: true, setDefaultsOnInsert: true }
@@ -324,7 +350,8 @@ const queryTelegramAssistant = asyncHandler(async (req, res) => {
     throw new Error("prompt is required");
   }
 
-  const reply = await generateTelegramAssistantReply(prompt);
+  const connectionKey = String(req.body?.connectionKey || req.query?.connectionKey || "").trim();
+  const reply = await generateTelegramAssistantReply(prompt, { connectionKey });
   res.json({ success: true, data: { prompt, reply } });
 });
 

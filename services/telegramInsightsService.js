@@ -10,11 +10,40 @@ const InsuranceClaim = require("../models/InsuranceClaim");
 const InsurancePayment = require("../models/InsurancePayment");
 const { currency } = require("./formatService");
 const { getFixedExpenseSnapshot } = require("./fixedExpenseService");
+const { listGoogleCalendarAppointments } = require("./googleCalendarService");
 const { isOpenAiConfigured, chatWithOpenAi } = require("./openAiService");
 
 const normalizeText = (value) => String(value || "").toLowerCase().trim();
 
 const includesAny = (text, keywords) => keywords.some((key) => text.includes(key));
+const YES_WORDS = new Set(["yes", "yeah", "yup", "sure", "ok", "okay", "please", "yes please", "do it", "go ahead"]);
+const NO_WORDS = new Set(["no", "nope", "nah", "not now", "stop", "cancel"]);
+const EMPTY_CONVERSATION_STATE = {
+  lastIntent: "",
+  pendingAction: "",
+  lastUserText: "",
+  lastAssistantText: "",
+  updatedAt: null
+};
+
+const sanitizeConversationState = (state = {}) => ({
+  ...EMPTY_CONVERSATION_STATE,
+  lastIntent: String(state.lastIntent || "").trim(),
+  pendingAction: String(state.pendingAction || "").trim(),
+  lastUserText: String(state.lastUserText || "").trim(),
+  lastAssistantText: String(state.lastAssistantText || "").trim(),
+  updatedAt: state.updatedAt || null
+});
+
+const isAffirmativeMessage = (rawText) => {
+  const text = normalizeText(rawText).replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
+  return Boolean(text) && (YES_WORDS.has(text) || text.startsWith("yes "));
+};
+
+const isNegativeMessage = (rawText) => {
+  const text = normalizeText(rawText).replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
+  return Boolean(text) && NO_WORDS.has(text);
+};
 
 const isGreetingMessage = (rawText) => {
   const normalized = normalizeText(rawText).replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
@@ -56,6 +85,18 @@ const identifyIntent = (rawText) => {
   const asksBreakdown = includesAny(text, ["which", "breakdown", "list", "from", "top"]);
   if (asksPartnerIncome && asksBreakdown) return "partner_income_breakdown";
   if (asksPartnerIncome) return "partner_income_total";
+
+  const mentionsPartner = includesAny(text, ["partner", "parner"]);
+  const asksCount = includesAny(text, ["how many", "count", "total", "number of"]);
+  const asksList = includesAny(text, ["list", "show", "names", "who"]);
+  if (mentionsPartner && asksCount) return "tiktok_partners_count";
+  if (mentionsPartner && asksList) return "tiktok_partners_list";
+  if (mentionsPartner) return "tiktok_partners_overview";
+
+  const mentionsClient = includesAny(text, ["insurance client", "insurance clients", "client", "clients"]);
+  if (mentionsClient && asksCount) return "insurance_clients_count";
+  if (mentionsClient && asksList) return "insurance_clients_list";
+  if (mentionsClient) return "insurance_clients_overview";
 
   const asksFixedExpenses =
     includesAny(text, ["fixed expense", "fixed expenses", "give list fixed expense", "monthly fixed", "office rent", "team salary"]) &&
@@ -149,7 +190,21 @@ const getInterestedCreatorsCount = async () => {
   return Number(agg[0]?.count || 0);
 };
 
-const getUpcomingAppointments = async (limit = 7) => {
+const mapDatabaseAppointments = (appointments = []) =>
+  appointments.map((item) => ({
+    customer: item.profile?.name || "-",
+    phone: item.profile?.phone || "-",
+    when: item.scheduledFor
+  }));
+
+const mapGoogleCalendarAppointments = (appointments = []) =>
+  appointments.map((item) => ({
+    customer: item.profile?.name || "-",
+    phone: item.profile?.phone || "-",
+    when: item.scheduledFor
+  }));
+
+const getDatabaseUpcomingAppointments = async (limit = 7) => {
   const appointments = await Appointment.find({
     scheduledFor: { $gte: new Date() },
     status: "scheduled"
@@ -159,14 +214,10 @@ const getUpcomingAppointments = async (limit = 7) => {
     .limit(limit)
     .lean();
 
-  return appointments.map((item) => ({
-    customer: item.profile?.name || "-",
-    phone: item.profile?.phone || "-",
-    when: item.scheduledFor
-  }));
+  return mapDatabaseAppointments(appointments);
 };
 
-const getTodayAppointments = async (limit = 10) => {
+const getDatabaseTodayAppointments = async (limit = 10) => {
   const start = dayjs().startOf("day").toDate();
   const end = dayjs().endOf("day").toDate();
 
@@ -179,11 +230,78 @@ const getTodayAppointments = async (limit = 10) => {
     .limit(limit)
     .lean();
 
-  return appointments.map((item) => ({
-    customer: item.profile?.name || "-",
-    phone: item.profile?.phone || "-",
-    when: item.scheduledFor
-  }));
+  return mapDatabaseAppointments(appointments);
+};
+
+const getGoogleCalendarUpcomingAppointments = async (connectionKey, limit = 30) => {
+  const appointments = await listGoogleCalendarAppointments({
+    connectionKey,
+    today: false,
+    maxResults: Math.max(limit, 10),
+    bookedOnly: true
+  });
+  return mapGoogleCalendarAppointments(appointments).slice(0, limit);
+};
+
+const getGoogleCalendarTodayAppointments = async (connectionKey, limit = 30) => {
+  const appointments = await listGoogleCalendarAppointments({
+    connectionKey,
+    today: true,
+    maxResults: Math.max(limit, 10),
+    bookedOnly: true
+  });
+  return mapGoogleCalendarAppointments(appointments).slice(0, limit);
+};
+
+const getGoogleCalendarFallbackNotice = (error) => {
+  const message = String(error?.message || "").toLowerCase();
+  if (message.includes("not connected")) {
+    return "Google Calendar is not connected for this workspace. Showing CRM database appointments instead.";
+  }
+
+  return "Could not read Google Calendar right now. Showing CRM database appointments instead.";
+};
+
+const getAppointmentsSnapshot = async ({ connectionKey, upcomingLimit = 5, todayLimit = 10 } = {}) => {
+  const normalizedKey = String(connectionKey || "").trim();
+  if (!normalizedKey) {
+    const [upcoming, todayAppointments] = await Promise.all([
+      getDatabaseUpcomingAppointments(upcomingLimit),
+      getDatabaseTodayAppointments(todayLimit)
+    ]);
+    return {
+      upcoming,
+      todayAppointments,
+      appointmentSource: "database",
+      appointmentSourceNotice: ""
+    };
+  }
+
+  try {
+    const [upcoming, todayAppointments] = await Promise.all([
+      getGoogleCalendarUpcomingAppointments(normalizedKey, upcomingLimit),
+      getGoogleCalendarTodayAppointments(normalizedKey, todayLimit)
+    ]);
+
+    return {
+      upcoming,
+      todayAppointments,
+      appointmentSource: "google_calendar",
+      appointmentSourceNotice: ""
+    };
+  } catch (error) {
+    const [upcoming, todayAppointments] = await Promise.all([
+      getDatabaseUpcomingAppointments(upcomingLimit),
+      getDatabaseTodayAppointments(todayLimit)
+    ]);
+
+    return {
+      upcoming,
+      todayAppointments,
+      appointmentSource: "database",
+      appointmentSourceNotice: getGoogleCalendarFallbackNotice(error)
+    };
+  }
 };
 
 const getInsuranceStatistics = async () => {
@@ -302,9 +420,51 @@ const getIdealCreatorsCount = async () => {
   return Number(total || 0);
 };
 
+const getIdealCreatorUsernames = async (limit = 20) => {
+  const rows = await IdealUser.find({})
+    .select("username")
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .lean();
+
+  return rows.map((row) => String(row.username || "").trim()).filter(Boolean);
+};
+
+const getTikTokPartners = async (limit = 10) => {
+  const rows = await Profile.find({ moduleMembership: "tiktok" })
+    .select("name phone tiktokData.creatorName tiktokData.tiktokUsername tiktokData.partnerRevenue")
+    .sort({ "tiktokData.partnerRevenue": -1, updatedAt: -1 })
+    .limit(limit)
+    .lean();
+
+  return rows.map((row) => ({
+    name: row.tiktokData?.creatorName || row.name || "-",
+    username: row.tiktokData?.tiktokUsername || "",
+    phone: row.phone || "",
+    revenue: Number(row.tiktokData?.partnerRevenue || 0)
+  }));
+};
+
+const getInsuranceClients = async (limit = 10) => {
+  const rows = await Profile.find({ moduleMembership: "insurance" })
+    .select("name phone email insuranceData.customerId insuranceData.policyNumber insuranceData.status")
+    .sort({ updatedAt: -1 })
+    .limit(limit)
+    .lean();
+
+  return rows.map((row) => ({
+    name: row.name || "-",
+    phone: row.phone || "",
+    email: row.email || "",
+    customerId: row.insuranceData?.customerId || "",
+    policyNumber: row.insuranceData?.policyNumber || "",
+    status: row.insuranceData?.status || "lead"
+  }));
+};
+
 const getFixedExpensesData = async () => getFixedExpenseSnapshot();
 
-const buildMetricsSnapshot = async () => {
+const buildMetricsSnapshot = async (options = {}) => {
   const [
     totalProfiles,
     insuranceClients,
@@ -312,8 +472,7 @@ const buildMetricsSnapshot = async () => {
     breakdown,
     totalIncome,
     interestedCreators,
-    upcoming,
-    todayAppointments,
+    appointmentsSnapshot,
     insurance,
     recentClaims,
     messageStats,
@@ -329,8 +488,11 @@ const buildMetricsSnapshot = async () => {
     getPartnerIncomeBreakdown(8),
     getPartnerIncomeTotal(),
     getInterestedCreatorsCount(),
-    getUpcomingAppointments(5),
-    getTodayAppointments(10),
+    getAppointmentsSnapshot({
+      connectionKey: options.connectionKey,
+      upcomingLimit: 5,
+      todayLimit: 10
+    }),
     getInsuranceStatistics(),
     getRecentClaims(5),
     getMessageDeliveryStats(),
@@ -351,8 +513,10 @@ const buildMetricsSnapshot = async () => {
     breakdown,
     totalIncome,
     interestedCreators,
-    upcoming,
-    todayAppointments,
+    upcoming: appointmentsSnapshot.upcoming,
+    todayAppointments: appointmentsSnapshot.todayAppointments,
+    appointmentSource: appointmentsSnapshot.appointmentSource,
+    appointmentSourceNotice: appointmentsSnapshot.appointmentSourceNotice,
     insurance: {
       ...insurance,
       recentClaims
@@ -378,6 +542,38 @@ const formatPartnerIncomeTotal = (total) => `Total partner income: ${currency(to
 
 const formatInterestedCreators = (count) => `Interested creators (reply received): ${count}.`;
 const formatIdealCreatorsCount = (count) => `Total ideal creators in database: ${count}.`;
+const formatIdealCreatorUsernames = (usernames) => {
+  if (!usernames.length) return "No ideal creator usernames found.";
+  return ["Ideal creator usernames:", ...usernames.map((name, index) => `${index + 1}. ${name}`)].join("\n");
+};
+
+const formatTikTokPartnersCount = (count) => `Total TikTok partners in agency CRM: ${count}.`;
+const formatInsuranceClientsCount = (count) => `Total insurance clients in CRM: ${count}.`;
+
+const formatTikTokPartners = (rows) => {
+  if (!rows.length) return "No TikTok partners found.";
+  return [
+    "TikTok partners:",
+    ...rows.map((row, index) => {
+      const username = row.username ? ` (@${row.username.replace(/^@/, "")})` : "";
+      const revenue = row.revenue > 0 ? ` - Revenue: ${currency(row.revenue)}` : "";
+      return `${index + 1}. ${row.name}${username}${revenue}`;
+    })
+  ].join("\n");
+};
+
+const formatInsuranceClients = (rows) => {
+  if (!rows.length) return "No insurance clients found.";
+  return [
+    "Insurance clients:",
+    ...rows.map((row, index) => {
+      const extras = [row.policyNumber ? `Policy ${row.policyNumber}` : "", row.status ? `Status ${row.status}` : ""]
+        .filter(Boolean)
+        .join(", ");
+      return `${index + 1}. ${row.name}${extras ? ` - ${extras}` : ""}`;
+    })
+  ].join("\n");
+};
 
 const formatFixedExpenses = (fixedExpenses) => {
   const items = Array.isArray(fixedExpenses?.items) ? fixedExpenses.items : [];
@@ -390,19 +586,40 @@ const formatFixedExpenses = (fixedExpenses) => {
   ].join("\n");
 };
 
-const formatUpcomingAppointments = (rows) => {
-  if (!rows.length) return "No upcoming appointments found.";
+const getAppointmentSourceLabel = (snapshot = {}) =>
+  snapshot.appointmentSource === "google_calendar" ? "Google Calendar" : "CRM database";
+
+const formatUpcomingAppointments = (rows, snapshot = {}) => {
+  const sourceLabel = getAppointmentSourceLabel(snapshot);
+  const notice = String(snapshot.appointmentSourceNotice || "").trim();
+  if (!rows.length) {
+    return [notice, `No upcoming appointments found in ${sourceLabel}.`].filter(Boolean).join("\n");
+  }
+
   return [
-    "Upcoming appointments:",
-    ...rows.map((row, index) => `${index + 1}. ${row.customer} (${row.phone}) - ${dayjs(row.when).format("MMM DD, hh:mm A")}`)
+    notice,
+    `Upcoming appointments (${sourceLabel}):`,
+    ...rows.map((row, index) => {
+      const phonePart = row.phone && row.phone !== "-" ? ` (${row.phone})` : "";
+      return `${index + 1}. ${row.customer}${phonePart} - ${dayjs(row.when).format("MMM DD, hh:mm A")}`;
+    })
   ].join("\n");
 };
 
-const formatTodayAppointments = (rows) => {
-  if (!rows.length) return "No scheduled appointments found for today.";
+const formatTodayAppointments = (rows, snapshot = {}) => {
+  const sourceLabel = getAppointmentSourceLabel(snapshot);
+  const notice = String(snapshot.appointmentSourceNotice || "").trim();
+  if (!rows.length) {
+    return [notice, `No scheduled appointments found for today in ${sourceLabel}.`].filter(Boolean).join("\n");
+  }
+
   return [
-    "Today's appointments:",
-    ...rows.map((row, index) => `${index + 1}. ${row.customer} (${row.phone}) - ${dayjs(row.when).format("hh:mm A")}`)
+    notice,
+    `Today's appointments (${sourceLabel}):`,
+    ...rows.map((row, index) => {
+      const phonePart = row.phone && row.phone !== "-" ? ` (${row.phone})` : "";
+      return `${index + 1}. ${row.customer}${phonePart} - ${dayjs(row.when).format("hh:mm A")}`;
+    })
   ].join("\n");
 };
 
@@ -410,20 +627,24 @@ const formatAppointmentCheck = (snapshot) => {
   const todayCount = snapshot.todayAppointments.length;
   const upcomingCount = snapshot.upcoming.length;
   const nextAppointment = snapshot.upcoming[0] || snapshot.todayAppointments[0];
+  const sourceLabel = getAppointmentSourceLabel(snapshot);
+  const notice = String(snapshot.appointmentSourceNotice || "").trim();
 
   if (!todayCount && !upcomingCount) {
-    return "No scheduled appointment found in database right now.";
+    return [notice, `No scheduled appointment found in ${sourceLabel} right now.`].filter(Boolean).join("\n");
   }
 
   const lines = [
-    `Yes, appointment data found in database.`,
+    notice,
+    `Yes, appointment data found in ${sourceLabel}.`,
     `- Today: ${todayCount}`,
     `- Upcoming: ${upcomingCount}`
-  ];
+  ].filter(Boolean);
 
   if (nextAppointment) {
+    const phonePart = nextAppointment.phone && nextAppointment.phone !== "-" ? ` (${nextAppointment.phone})` : "";
     lines.push(
-      `- Next: ${nextAppointment.customer} (${nextAppointment.phone}) at ${dayjs(nextAppointment.when).format("MMM DD, hh:mm A")}`
+      `- Next: ${nextAppointment.customer}${phonePart} at ${dayjs(nextAppointment.when).format("MMM DD, hh:mm A")}`
     );
   }
 
@@ -434,7 +655,7 @@ const formatAgentWorkflowCapabilities = () =>
   [
     "Telegram CRM agent workflow is active.",
     "Current controls:",
-    "- Read upcoming and today's appointments from database",
+    "- Read upcoming and today's appointments from Google Calendar (with CRM fallback)",
     "- Read fixed expense list and monthly total",
     "- Revenue summary, creator overview, insurance stats, CRM summary",
     "- English-only chat responses",
@@ -513,38 +734,125 @@ const buildHelpReply = (options = {}) =>
     "6) Do I have appointment today?",
     "7) How many ideal creators are there now?",
     "8) Show fixed expense list.",
-    "9) Give a full CRM summary.",
+    "9) Show TikTok partner list.",
+    "10) Show insurance client list.",
+    "11) Give a full CRM summary.",
     "",
     "Quick commands: /appointments, /today, /fixed, /summary"
     ].join("\n")
   );
 
-const buildDeterministicReply = (intent, snapshot, options = {}) => {
-  if (intent === "help") return buildHelpReply(options);
-  if (intent === "partner_income_breakdown")
-    return buildChatReply(formatPartnerIncomeBreakdown(snapshot.breakdown), options, "Would you like a top-3 summary as well?");
-  if (intent === "partner_income_total")
-    return buildChatReply(formatPartnerIncomeTotal(snapshot.totalIncome), options, "Do you want the monthly expense and net result too?");
-  if (intent === "fixed_expenses_list")
-    return buildChatReply(formatFixedExpenses(snapshot.expenses), options, "If you want, I can also show variable expenses.");
-  if (intent === "ideal_creators_count")
-    return buildChatReply(formatIdealCreatorsCount(snapshot.tiktok.idealCreatorsCount), options, "Would you like me to list their usernames too?");
-  if (intent === "interested_creators")
-    return buildChatReply(formatInterestedCreators(snapshot.interestedCreators), options, "Should I show recent reply activity next?");
-  if (intent === "appointment_check")
-    return buildChatReply(formatAppointmentCheck(snapshot), options, "Would you like today's appointment list?");
-  if (intent === "today_appointments")
-    return buildChatReply(formatTodayAppointments(snapshot.todayAppointments), options, "Do you also want upcoming appointments for the week?");
-  if (intent === "upcoming_appointments")
-    return buildChatReply(formatUpcomingAppointments(snapshot.upcoming), options, "Would you like this filtered by date range?");
-  if (intent === "agent_workflow")
-    return buildChatReply(formatAgentWorkflowCapabilities(), options, "Tell me which control you want to add first.");
-  if (intent === "insurance_statistics")
-    return buildChatReply(formatInsuranceStatistics(snapshot.insurance), options, "Would you like claim details as the next step?");
-  if (intent === "tiktok_overview")
-    return buildChatReply(formatTikTokOverview(snapshot), options, "Should I break this down by creator?");
-  if (intent === "crm_overview")
-    return buildChatReply(formatCrmOverview(snapshot), options, "Do you want a focused view for insurance or TikTok?");
+const buildDeterministicReply = async (intent, snapshot, options = {}) => {
+  if (intent === "help") {
+    return { reply: buildHelpReply(options) };
+  }
+
+  if (intent === "partner_income_breakdown") {
+    return { reply: buildChatReply(formatPartnerIncomeBreakdown(snapshot.breakdown), options) };
+  }
+
+  if (intent === "partner_income_total") {
+    return { reply: buildChatReply(formatPartnerIncomeTotal(snapshot.totalIncome), options) };
+  }
+
+  if (intent === "fixed_expenses_list") {
+    return { reply: buildChatReply(formatFixedExpenses(snapshot.expenses), options) };
+  }
+
+  if (intent === "ideal_creators_count") {
+    return {
+      reply: buildChatReply(
+        formatIdealCreatorsCount(snapshot.tiktok.idealCreatorsCount),
+        options,
+        "Would you like me to list their usernames?"
+      ),
+      pendingAction: "list_ideal_usernames"
+    };
+  }
+
+  if (intent === "tiktok_partners_count") {
+    return {
+      reply: buildChatReply(
+        formatTikTokPartnersCount(snapshot.overview.tiktokCreators),
+        options,
+        "Would you like the partner list too?"
+      ),
+      pendingAction: "list_tiktok_partners"
+    };
+  }
+
+  if (intent === "tiktok_partners_list" || intent === "tiktok_partners_overview") {
+    const partners = await getTikTokPartners(10);
+    return { reply: buildChatReply(formatTikTokPartners(partners), options) };
+  }
+
+  if (intent === "insurance_clients_count") {
+    return {
+      reply: buildChatReply(
+        formatInsuranceClientsCount(snapshot.overview.insuranceClients),
+        options,
+        "Would you like the client list too?"
+      ),
+      pendingAction: "list_insurance_clients"
+    };
+  }
+
+  if (intent === "insurance_clients_list" || intent === "insurance_clients_overview") {
+    const clients = await getInsuranceClients(10);
+    return { reply: buildChatReply(formatInsuranceClients(clients), options) };
+  }
+
+  if (intent === "interested_creators") {
+    return { reply: buildChatReply(formatInterestedCreators(snapshot.interestedCreators), options) };
+  }
+
+  if (intent === "appointment_check") {
+    return { reply: buildChatReply(formatAppointmentCheck(snapshot), options) };
+  }
+
+  if (intent === "today_appointments") {
+    return { reply: buildChatReply(formatTodayAppointments(snapshot.todayAppointments, snapshot), options) };
+  }
+
+  if (intent === "upcoming_appointments") {
+    return { reply: buildChatReply(formatUpcomingAppointments(snapshot.upcoming, snapshot), options) };
+  }
+
+  if (intent === "agent_workflow") {
+    return { reply: buildChatReply(formatAgentWorkflowCapabilities(), options) };
+  }
+
+  if (intent === "insurance_statistics") {
+    return { reply: buildChatReply(formatInsuranceStatistics(snapshot.insurance), options) };
+  }
+
+  if (intent === "tiktok_overview") {
+    return { reply: buildChatReply(formatTikTokOverview(snapshot), options) };
+  }
+
+  if (intent === "crm_overview") {
+    return { reply: buildChatReply(formatCrmOverview(snapshot), options) };
+  }
+
+  return null;
+};
+
+const resolvePendingActionReply = async (pendingAction, snapshot, options = {}) => {
+  if (pendingAction === "list_ideal_usernames") {
+    const usernames = await getIdealCreatorUsernames(20);
+    return buildChatReply(formatIdealCreatorUsernames(usernames), options);
+  }
+
+  if (pendingAction === "list_tiktok_partners") {
+    const partners = await getTikTokPartners(10);
+    return buildChatReply(formatTikTokPartners(partners), options);
+  }
+
+  if (pendingAction === "list_insurance_clients") {
+    const clients = await getInsuranceClients(10);
+    return buildChatReply(formatInsuranceClients(clients), options);
+  }
+
   return "";
 };
 
@@ -577,6 +885,8 @@ const buildContextText = (snapshot) =>
       },
       expenses: snapshot.expenses,
       interestedCreators: snapshot.interestedCreators,
+      appointmentSource: snapshot.appointmentSource,
+      appointmentSourceNotice: snapshot.appointmentSourceNotice,
       todayAppointments: snapshot.todayAppointments.map((item) => ({
         customer: item.customer,
         phone: item.phone,
@@ -592,6 +902,21 @@ const buildContextText = (snapshot) =>
     2
   );
 
+const buildConversationContextText = (state = {}) => {
+  const normalized = sanitizeConversationState(state);
+  if (!normalized.lastUserText && !normalized.lastAssistantText) return "";
+
+  return [
+    "Recent conversation memory:",
+    normalized.lastIntent ? `- Last intent: ${normalized.lastIntent}` : "",
+    normalized.pendingAction ? `- Pending action: ${normalized.pendingAction}` : "",
+    normalized.lastUserText ? `- Previous user message: ${normalized.lastUserText}` : "",
+    normalized.lastAssistantText ? `- Previous assistant reply: ${normalized.lastAssistantText}` : ""
+  ]
+    .filter(Boolean)
+    .join("\n");
+};
+
 const HUMAM_SYSTEM_PROMPT =
   "You are Humam, a professional, friendly, human-like relationship manager for a combined Insurance CRM and TikTok Agency CRM. " +
   "Always reply in English only. Keep responses natural, confident, and practical, usually within 3-7 sentences unless asked for detail. " +
@@ -606,15 +931,16 @@ const buildLlmReply = async (userText, snapshot, options = {}) => {
   }
 
   const displayName = String(options.displayName || "").trim() || "Customer";
-  const userPrompt = [
+  const conversationMemory = buildConversationContextText(options.conversationState);
+  const promptSections = [
     `User display name: ${displayName}`,
     `User message: ${userText}`,
-    "",
+    conversationMemory,
     "Authoritative CRM snapshot (JSON):",
     buildContextText(snapshot),
-    "",
     "Instruction: answer the user now."
-  ].join("\n");
+  ].filter(Boolean);
+  const userPrompt = promptSections.join("\n\n");
 
   const answer = await chatWithOpenAi({
     systemPrompt: HUMAM_SYSTEM_PROMPT,
@@ -625,33 +951,70 @@ const buildLlmReply = async (userText, snapshot, options = {}) => {
   return answer || "I could not generate a response right now.";
 };
 
-const generateTelegramAssistantReply = async (userText, options = {}) => {
-  if (isGreetingMessage(userText)) {
-    return buildGreetingReply(options.displayName);
+const generateTelegramAssistantTurn = async (userText, options = {}) => {
+  const priorState = sanitizeConversationState(options.conversationState);
+  const trimmedUserText = String(userText || "").trim();
+  const finalize = (reply, currentIntent, pendingAction = "") => ({
+    reply,
+    conversationState: {
+      lastIntent: currentIntent || "",
+      pendingAction: pendingAction || "",
+      lastUserText: trimmedUserText,
+      lastAssistantText: String(reply || "").trim(),
+      updatedAt: new Date().toISOString()
+    }
+  });
+
+  if (isGreetingMessage(trimmedUserText)) {
+    return finalize(buildGreetingReply(options.displayName), "greeting");
   }
 
-  if (isHelpRequest(userText)) {
-    return buildHelpReply(options);
+  if (isHelpRequest(trimmedUserText)) {
+    return finalize(buildHelpReply(options), "help");
   }
 
-  const snapshot = await buildMetricsSnapshot();
-  const intent = identifyIntent(userText);
-  const deterministic = buildDeterministicReply(intent, snapshot, options);
-  if (deterministic) return deterministic;
+  const snapshot = await buildMetricsSnapshot({ connectionKey: options.connectionKey });
+
+  if (priorState.pendingAction && isAffirmativeMessage(trimmedUserText)) {
+    const followUpReply = await resolvePendingActionReply(priorState.pendingAction, snapshot, options);
+    if (followUpReply) {
+      return finalize(followUpReply, "follow_up", "");
+    }
+  }
+
+  if (priorState.pendingAction && isNegativeMessage(trimmedUserText)) {
+    return finalize(buildChatReply("No problem. Let me know what you need next.", options), "follow_up", "");
+  }
+
+  const intent = identifyIntent(trimmedUserText);
+  const deterministic = await buildDeterministicReply(intent, snapshot, options);
+  if (deterministic?.reply) {
+    return finalize(deterministic.reply, intent, deterministic.pendingAction || "");
+  }
 
   try {
-    return await buildLlmReply(userText, snapshot, options);
+    const llmReply = await buildLlmReply(trimmedUserText, snapshot, options);
+    return finalize(llmReply, intent || "general");
   } catch (error) {
-    return [
-      "I could not generate the full AI answer right now.",
-      `Reason: ${error.message || "Unknown error"}`,
-      "",
-      formatCrmOverview(snapshot)
-    ].join("\n");
+    return finalize(
+      [
+        "I could not generate the full AI answer right now.",
+        `Reason: ${error.message || "Unknown error"}`,
+        "",
+        formatCrmOverview(snapshot)
+      ].join("\n"),
+      intent || "general"
+    );
   }
 };
 
+const generateTelegramAssistantReply = async (userText, options = {}) => {
+  const turn = await generateTelegramAssistantTurn(userText, options);
+  return turn.reply;
+};
+
 module.exports = {
+  generateTelegramAssistantTurn,
   generateTelegramAssistantReply,
   buildMetricsSnapshot,
   identifyIntent
