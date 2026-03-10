@@ -9,6 +9,7 @@ const InsurancePolicy = require("../models/InsurancePolicy");
 const InsuranceClaim = require("../models/InsuranceClaim");
 const InsurancePayment = require("../models/InsurancePayment");
 const { currency } = require("./formatService");
+const { getFixedExpenseSnapshot } = require("./fixedExpenseService");
 const { isOpenAiConfigured, chatWithOpenAi } = require("./openAiService");
 
 const normalizeText = (value) => String(value || "").toLowerCase().trim();
@@ -48,33 +49,45 @@ const identifyIntent = (rawText) => {
   if (isHelpRequest(text)) return "help";
   if (text === "/appointments" || text === "/appointment") return "upcoming_appointments";
   if (text === "/today_appointments" || text === "/today") return "today_appointments";
+  if (text === "/fixed_expenses" || text === "/fixed") return "fixed_expenses_list";
   if (text === "/summary" || text === "/crm") return "crm_overview";
 
-  const asksPartnerIncome = includesAny(text, ["partner", "parner"]) && includesAny(text, ["income", "revenew", "revenue"]);
-  const asksBreakdown = includesAny(text, ["kon", "which", "breakdown", "list", "from"]);
+  const asksPartnerIncome = includesAny(text, ["partner"]) && includesAny(text, ["income", "revenue", "earning"]);
+  const asksBreakdown = includesAny(text, ["which", "breakdown", "list", "from", "top"]);
   if (asksPartnerIncome && asksBreakdown) return "partner_income_breakdown";
   if (asksPartnerIncome) return "partner_income_total";
 
-  if (includesAny(text, ["creator", "creatro", "interest", "interrest"])) {
+  const asksFixedExpenses =
+    includesAny(text, ["fixed expense", "fixed expenses", "give list fixed expense", "monthly fixed", "office rent", "team salary"]) &&
+    !includesAny(text, ["variable"]);
+  if (asksFixedExpenses) return "fixed_expenses_list";
+
+  const asksIdealCreatorCount = includesAny(text, [
+    "ideal creator",
+    "ideal creators",
+    "ideal user",
+    "ideal users",
+    "how many ideal",
+    "ideal count"
+  ]);
+  if (asksIdealCreatorCount) return "ideal_creators_count";
+
+  if (includesAny(text, ["creator", "interest", "interested"])) {
     return "interested_creators";
   }
 
   const appointmentRelated = includesAny(text, [
     "upcoming",
     "appointment",
-    "appint",
-    "appoinment",
     "appt",
     "meeting",
     "schedule",
-    "booked",
-    "অ্যাপয়েন্টমেন্ট",
-    "এপয়েন্টমেন্ট"
+    "booked"
   ]);
   const asksAppointmentCheck =
     appointmentRelated &&
-    includesAny(text, ["ache kina", "ase kina", "ache ki", "ase ki", "have any", "do i have", "amar", "আছে কিনা", "আছে কি"]);
-  const asksTodayAppointments = appointmentRelated && includesAny(text, ["today", "aj", "ajke", "আজ"]);
+    includesAny(text, ["have any", "do i have", "is there any", "do we have"]);
+  const asksTodayAppointments = appointmentRelated && includesAny(text, ["today", "todays", "for today"]);
 
   if (asksAppointmentCheck) return "appointment_check";
   if (asksTodayAppointments) return "today_appointments";
@@ -82,7 +95,7 @@ const identifyIntent = (rawText) => {
     return "upcoming_appointments";
   }
 
-  if (includesAny(text, ["agent", "workflow", "automation", "auto", "control", "manage everything", "sob control"])) {
+  if (includesAny(text, ["agent", "workflow", "automation", "auto", "control", "manage everything"])) {
     return "agent_workflow";
   }
 
@@ -284,6 +297,13 @@ const getIdealUserPreview = async (limit = 5) => {
   }));
 };
 
+const getIdealCreatorsCount = async () => {
+  const total = await IdealUser.countDocuments({});
+  return Number(total || 0);
+};
+
+const getFixedExpensesData = async () => getFixedExpenseSnapshot();
+
 const buildMetricsSnapshot = async () => {
   const [
     totalProfiles,
@@ -299,7 +319,9 @@ const buildMetricsSnapshot = async () => {
     messageStats,
     monthlyAgencyRevenue,
     creatorDailySummary,
-    idealUsers
+    idealUsers,
+    idealCreatorsCount,
+    fixedExpenses
   ] = await Promise.all([
     Profile.countDocuments({}),
     Profile.countDocuments({ moduleMembership: "insurance" }),
@@ -314,7 +336,9 @@ const buildMetricsSnapshot = async () => {
     getMessageDeliveryStats(),
     getMonthlyAgencyRevenue(),
     getCreatorDailySummary(),
-    getIdealUserPreview(5)
+    getIdealUserPreview(5),
+    getIdealCreatorsCount(),
+    getFixedExpensesData()
   ]);
 
   return {
@@ -333,12 +357,14 @@ const buildMetricsSnapshot = async () => {
       ...insurance,
       recentClaims
     },
+    expenses: fixedExpenses,
     tiktok: {
       creatorsCount: tiktokCreators,
       monthlyAgencyRevenue,
       messageStats,
       creatorDailySummary,
-      idealUsers
+      idealUsers,
+      idealCreatorsCount
     }
   };
 };
@@ -351,6 +377,18 @@ const formatPartnerIncomeBreakdown = (rows) => {
 const formatPartnerIncomeTotal = (total) => `Total partner income: ${currency(total)}.`;
 
 const formatInterestedCreators = (count) => `Interested creators (reply received): ${count}.`;
+const formatIdealCreatorsCount = (count) => `Total ideal creators in database: ${count}.`;
+
+const formatFixedExpenses = (fixedExpenses) => {
+  const items = Array.isArray(fixedExpenses?.items) ? fixedExpenses.items : [];
+  if (!items.length) return "No fixed expenses configured.";
+
+  return [
+    "Fixed expense list:",
+    ...items.map((item, index) => `${index + 1}. ${item.title}: ${currency(item.amount)}`),
+    `Monthly fixed expense total: ${currency(fixedExpenses.monthlyTotal || 0)}`
+  ].join("\n");
+};
 
 const formatUpcomingAppointments = (rows) => {
   if (!rows.length) return "No upcoming appointments found.";
@@ -397,8 +435,9 @@ const formatAgentWorkflowCapabilities = () =>
     "Telegram CRM agent workflow is active.",
     "Current controls:",
     "- Read upcoming and today's appointments from database",
+    "- Read fixed expense list and monthly total",
     "- Revenue summary, creator overview, insurance stats, CRM summary",
-    "- Multi-language chat (Bangla/English mixed)",
+    "- English-only chat responses",
     "Suggested next upgrades for full control:",
     "1) Create/update appointment from Telegram command",
     "2) Customer lookup + follow-up action by name/phone",
@@ -438,19 +477,33 @@ const formatCrmOverview = (snapshot) =>
     `- Monthly agency revenue: ${currency(snapshot.tiktok.monthlyAgencyRevenue)}`
   ].join("\n");
 
-const buildGreetingReply = (displayName = "") => {
-  const user = String(displayName || "").trim();
-  const namePart = user ? ` ${user}` : "";
-  return [
-    `${getGreetingByTime()}${namePart}.`,
-    "I am Humam, your CRM AI assistant for Insurance + TikTok Agency operations.",
-    "I can help with partner revenue, creator follow-up, insurance stats, claims, payments, and upcoming appointments.",
-    "Ask me in English. I will always reply in English."
-  ].join(" ");
+const getGreetingName = (displayName = "") => {
+  const name = String(displayName || "").trim();
+  if (!name) return "";
+  const first = name.split(/\s+/)[0];
+  return first || "";
 };
 
-const buildHelpReply = () =>
-  [
+const buildChatReply = (body, options = {}, followUp = "") => {
+  const firstName = getGreetingName(options.displayName);
+  const greeting = firstName ? `Hello ${firstName}!` : "Hello!";
+  return [greeting, body, followUp].filter(Boolean).join("\n");
+};
+
+const buildGreetingReply = (displayName = "") => {
+  const firstName = getGreetingName(displayName);
+  const namePart = firstName ? ` ${firstName}` : "";
+  return [
+    `${getGreetingByTime()}${namePart}!`,
+    "Welcome back.",
+    "I am doing well, thank you.",
+    "How can I assist you today?"
+  ].join("\n");
+};
+
+const buildHelpReply = (options = {}) =>
+  buildChatReply(
+    [
     "You can ask me questions like:",
     "1) Total partner income this month?",
     "2) Which creators generated highest revenue?",
@@ -458,23 +511,40 @@ const buildHelpReply = () =>
     "4) Any policies expiring soon?",
     "5) Show upcoming appointments.",
     "6) Do I have appointment today?",
-    "7) Give a full CRM summary.",
+    "7) How many ideal creators are there now?",
+    "8) Show fixed expense list.",
+    "9) Give a full CRM summary.",
     "",
-    "Quick commands: /appointments, /today, /summary"
-  ].join("\n");
+    "Quick commands: /appointments, /today, /fixed, /summary"
+    ].join("\n")
+  );
 
-const buildDeterministicReply = (intent, snapshot) => {
-  if (intent === "help") return buildHelpReply();
-  if (intent === "partner_income_breakdown") return formatPartnerIncomeBreakdown(snapshot.breakdown);
-  if (intent === "partner_income_total") return formatPartnerIncomeTotal(snapshot.totalIncome);
-  if (intent === "interested_creators") return formatInterestedCreators(snapshot.interestedCreators);
-  if (intent === "appointment_check") return formatAppointmentCheck(snapshot);
-  if (intent === "today_appointments") return formatTodayAppointments(snapshot.todayAppointments);
-  if (intent === "upcoming_appointments") return formatUpcomingAppointments(snapshot.upcoming);
-  if (intent === "agent_workflow") return formatAgentWorkflowCapabilities();
-  if (intent === "insurance_statistics") return formatInsuranceStatistics(snapshot.insurance);
-  if (intent === "tiktok_overview") return formatTikTokOverview(snapshot);
-  if (intent === "crm_overview") return formatCrmOverview(snapshot);
+const buildDeterministicReply = (intent, snapshot, options = {}) => {
+  if (intent === "help") return buildHelpReply(options);
+  if (intent === "partner_income_breakdown")
+    return buildChatReply(formatPartnerIncomeBreakdown(snapshot.breakdown), options, "Would you like a top-3 summary as well?");
+  if (intent === "partner_income_total")
+    return buildChatReply(formatPartnerIncomeTotal(snapshot.totalIncome), options, "Do you want the monthly expense and net result too?");
+  if (intent === "fixed_expenses_list")
+    return buildChatReply(formatFixedExpenses(snapshot.expenses), options, "If you want, I can also show variable expenses.");
+  if (intent === "ideal_creators_count")
+    return buildChatReply(formatIdealCreatorsCount(snapshot.tiktok.idealCreatorsCount), options, "Would you like me to list their usernames too?");
+  if (intent === "interested_creators")
+    return buildChatReply(formatInterestedCreators(snapshot.interestedCreators), options, "Should I show recent reply activity next?");
+  if (intent === "appointment_check")
+    return buildChatReply(formatAppointmentCheck(snapshot), options, "Would you like today's appointment list?");
+  if (intent === "today_appointments")
+    return buildChatReply(formatTodayAppointments(snapshot.todayAppointments), options, "Do you also want upcoming appointments for the week?");
+  if (intent === "upcoming_appointments")
+    return buildChatReply(formatUpcomingAppointments(snapshot.upcoming), options, "Would you like this filtered by date range?");
+  if (intent === "agent_workflow")
+    return buildChatReply(formatAgentWorkflowCapabilities(), options, "Tell me which control you want to add first.");
+  if (intent === "insurance_statistics")
+    return buildChatReply(formatInsuranceStatistics(snapshot.insurance), options, "Would you like claim details as the next step?");
+  if (intent === "tiktok_overview")
+    return buildChatReply(formatTikTokOverview(snapshot), options, "Should I break this down by creator?");
+  if (intent === "crm_overview")
+    return buildChatReply(formatCrmOverview(snapshot), options, "Do you want a focused view for insurance or TikTok?");
   return "";
 };
 
@@ -490,6 +560,7 @@ const buildContextText = (snapshot) =>
         monthlyAgencyRevenue: snapshot.tiktok.monthlyAgencyRevenue,
         messageStats: snapshot.tiktok.messageStats,
         creatorDailySummary: snapshot.tiktok.creatorDailySummary,
+        idealCreatorsCount: snapshot.tiktok.idealCreatorsCount,
         topPartnerIncomeCreators: snapshot.breakdown,
         topIdealUsers: snapshot.tiktok.idealUsers
       },
@@ -504,6 +575,7 @@ const buildContextText = (snapshot) =>
         outstandingBalance: snapshot.insurance.outstandingBalance,
         recentClaims: snapshot.insurance.recentClaims
       },
+      expenses: snapshot.expenses,
       interestedCreators: snapshot.interestedCreators,
       todayAppointments: snapshot.todayAppointments.map((item) => ({
         customer: item.customer,
@@ -559,12 +631,12 @@ const generateTelegramAssistantReply = async (userText, options = {}) => {
   }
 
   if (isHelpRequest(userText)) {
-    return buildHelpReply();
+    return buildHelpReply(options);
   }
 
   const snapshot = await buildMetricsSnapshot();
   const intent = identifyIntent(userText);
-  const deterministic = buildDeterministicReply(intent, snapshot);
+  const deterministic = buildDeterministicReply(intent, snapshot, options);
   if (deterministic) return deterministic;
 
   try {

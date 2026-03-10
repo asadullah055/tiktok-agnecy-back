@@ -3,18 +3,12 @@ const IncomeSource = require("../models/IncomeSource");
 const Profile = require("../models/Profile");
 const asyncHandler = require("../middlewares/asyncHandler");
 const { logActivity } = require("../services/activityService");
+const { getFixedExpenseSnapshot, getFixedExpenseTotal, upsertFixedExpense } = require("../services/fixedExpenseService");
 
 const DEFAULT_INCOME_SOURCES = ["Gift Revenue", "Live Bonus", "Agency Commission", "Sponsorship"];
-const FIXED_EXPENSES = [
-  { key: "office_rent", title: "Office Rent", amount: 150 },
-  { key: "team_salary", title: "Team Salary", amount: 280 },
-  { key: "tools", title: "Software Tools", amount: 90 }
-];
 
 const hasValue = (value) => value !== undefined && value !== null && value !== "";
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-const fixedExpenseTotal = () => FIXED_EXPENSES.reduce((sum, item) => sum + Number(item.amount || 0), 0);
 
 const ensureDefaultIncomeSources = async () => {
   const count = await IncomeSource.countDocuments();
@@ -187,7 +181,7 @@ const getIncomeSummary = asyncHandler(async (req, res) => {
 
   const partnerIncomeTotal = Number(partnerIncomeAgg[0]?.total || 0);
   const partnerPaidCount = Number(partnerIncomeAgg[0]?.count || 0);
-  const fixedExpense = fixedExpenseTotal();
+  const fixedExpense = await getFixedExpenseTotal();
   const variableExpense = Number(variableExpenseAgg[0]?.total || 0);
   const variableCount = Number(variableExpenseAgg[0]?.count || 0);
   const totalExpense = fixedExpense + variableExpense;
@@ -247,11 +241,33 @@ const addIncomeSource = asyncHandler(async (req, res) => {
 const listFixedExpenses = asyncHandler(async (req, res) => {
   res.json({
     success: true,
-    data: {
-      items: FIXED_EXPENSES,
-      monthlyTotal: fixedExpenseTotal()
-    }
+    data: await getFixedExpenseSnapshot()
   });
+});
+
+const addFixedExpense = asyncHandler(async (req, res) => {
+  const title = String(req.body?.title || "").trim();
+  const amount = Number(req.body?.amount || 0);
+
+  if (!title) {
+    res.status(400);
+    throw new Error("Fixed expense title is required");
+  }
+
+  if (!Number.isFinite(amount) || amount < 0) {
+    res.status(400);
+    throw new Error("Fixed expense amount must be a valid number");
+  }
+
+  const result = await upsertFixedExpense({ title, amount });
+
+  await logActivity({
+    type: "fixed_expense_saved",
+    module: "tiktok",
+    message: `Fixed expense saved: ${result.item.title}`
+  });
+
+  res.status(result.created ? 201 : 200).json({ success: true, data: result.item });
 });
 
 module.exports = {
@@ -260,5 +276,6 @@ module.exports = {
   getIncomeSummary,
   listIncomeSources,
   addIncomeSource,
-  listFixedExpenses
+  listFixedExpenses,
+  addFixedExpense
 };

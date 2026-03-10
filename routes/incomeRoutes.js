@@ -5,7 +5,8 @@ const {
   getIncomeSummary,
   listIncomeSources,
   addIncomeSource,
-  listFixedExpenses
+  listFixedExpenses,
+  addFixedExpense
 } = require("../controllers/incomeController");
 
 const router = express.Router();
@@ -13,6 +14,6 @@ const router = express.Router();
 router.route("/records").get(listIncomeRecords).post(addIncomeRecord);
 router.get("/summary", getIncomeSummary);
 router.route("/sources").get(listIncomeSources).post(addIncomeSource);
-router.get("/fixed-expenses", listFixedExpenses);
+router.route("/fixed-expenses").get(listFixedExpenses).post(addFixedExpense);
 
 module.exports = router;
