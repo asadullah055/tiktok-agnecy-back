@@ -315,6 +315,24 @@ const mergeStructuredFields = (rawUserText = "", fieldDefs = [], existingData = 
   return { ...existingData, ...parsedFromText };
 };
 
+const buildInitialInsuranceClientPrompt = () =>
+  [
+    "Add insurance client started.",
+    "Please send client information in one message.",
+    "Example: Full Name: Karim, Phone Number: 017XXXXXXXX, Email Address: karim@gmail.com",
+    "I will ask only missing fields after that.",
+    "Type cancel to stop."
+  ].join("\n");
+
+const buildInitialInsurancePolicyPrompt = () =>
+  [
+    "Add policy information started.",
+    "Please send policy information in one message.",
+    "Example: Policy Number: P-1001, Policy Type: Health, Customer ID: C-101",
+    "I will ask only missing fields after that.",
+    "Type cancel to stop."
+  ].join("\n");
+
 const buildInsuranceClientConfirmation = (profile, created) =>
   [
     created ? "Insurance client added successfully." : "Insurance client updated successfully.",
@@ -440,7 +458,15 @@ const saveInsurancePolicyFromTelegram = async (payload = {}) => {
 const startInsuranceClientOnboarding = async (rawUserText) => {
   const extractedName = extractInsuranceClientNameFromRequest(rawUserText);
   const merged = mergeStructuredFields(rawUserText, INSURANCE_CLIENT_FIELDS, extractedName ? { fullName: extractedName } : {});
+  const hasAnyStructuredValue = Object.keys(merged).length > 0;
   const { normalizedData, missingKeys, invalidFields } = evaluateFieldCollection(INSURANCE_CLIENT_FIELDS, merged);
+
+  if (!hasAnyStructuredValue) {
+    return {
+      reply: buildOnboardingReply(buildInitialInsuranceClientPrompt()),
+      pendingAction: createPendingActionValue(INSURANCE_CLIENT_PENDING_PREFIX, {})
+    };
+  }
 
   if (!missingKeys.length && !invalidFields.length) {
     try {
@@ -462,7 +488,15 @@ const startInsuranceClientOnboarding = async (rawUserText) => {
 
 const startInsurancePolicyOnboarding = async (rawUserText) => {
   const merged = mergeStructuredFields(rawUserText, INSURANCE_POLICY_FIELDS, {});
+  const hasAnyStructuredValue = Object.keys(merged).length > 0;
   const { normalizedData, missingKeys, invalidFields } = evaluateFieldCollection(INSURANCE_POLICY_FIELDS, merged);
+
+  if (!hasAnyStructuredValue) {
+    return {
+      reply: buildOnboardingReply(buildInitialInsurancePolicyPrompt()),
+      pendingAction: createPendingActionValue(INSURANCE_POLICY_PENDING_PREFIX, {})
+    };
+  }
 
   if (!missingKeys.length && !invalidFields.length) {
     try {
