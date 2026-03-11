@@ -30,7 +30,10 @@ const EMPTY_CONVERSATION_STATE = {
   updatedAt: null
 };
 const INSURANCE_CLIENT_PENDING_PREFIX = "insurance_client_add:";
+const INSURANCE_POLICY_PENDING_PREFIX = "insurance_policy_add:";
 const INSURANCE_CLIENT_STATUSES = ["lead", "active", "pending", "inactive"];
+const INSURANCE_POLICY_PAYMENT_FREQUENCIES = ["monthly", "yearly"];
+const INSURANCE_POLICY_STATUSES = ["active", "cancelled", "expired", "pending"];
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const sanitizeConversationState = (state = {}) => ({
@@ -42,32 +45,164 @@ const sanitizeConversationState = (state = {}) => ({
   updatedAt: state.updatedAt || null
 });
 
-const encodeInsuranceClientPendingState = (draft = {}) => {
+const normalizeInsuranceClientStatus = (value = "") => {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (INSURANCE_CLIENT_STATUSES.includes(normalized)) return normalized;
+  return "";
+};
+
+const normalizePolicyPaymentFrequency = (value = "") => {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (INSURANCE_POLICY_PAYMENT_FREQUENCIES.includes(normalized)) return normalized;
+  return "";
+};
+
+const normalizePolicyStatus = (value = "") => {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (INSURANCE_POLICY_STATUSES.includes(normalized)) return normalized;
+  return "";
+};
+
+const toNonNegativeNumber = (value) => {
+  const normalized = String(value ?? "")
+    .replace(/,/g, "")
+    .replace(/[^\d.]/g, "");
+  if (!normalized) return NaN;
+  const parsed = Number(normalized);
+  if (!Number.isFinite(parsed) || parsed < 0) return NaN;
+  return parsed;
+};
+
+const toIsoDateString = (value) => {
+  const parsed = dayjs(String(value || "").trim());
+  if (!parsed.isValid()) return "";
+  return parsed.format("YYYY-MM-DD");
+};
+
+const INSURANCE_CLIENT_FIELDS = [
+  { key: "fullName", label: "Full Name", aliases: ["full name", "name", "client name"], required: true },
+  { key: "phone", label: "Phone Number", aliases: ["phone", "phone number", "mobile"], required: true },
+  {
+    key: "email",
+    label: "Email Address",
+    aliases: ["email", "email address", "mail"],
+    required: true,
+    normalize: (value) => String(value || "").trim().toLowerCase(),
+    validate: (value) => (EMAIL_REGEX.test(value) ? "" : "Email format is invalid.")
+  },
+  { key: "customerId", label: "Customer ID", aliases: ["customer id", "customerid", "id"], required: true },
+  { key: "policyType", label: "Policy Type", aliases: ["policy type", "policy"], required: true },
+  {
+    key: "status",
+    label: "Status",
+    aliases: ["status", "client status"],
+    required: true,
+    normalize: (value) => normalizeInsuranceClientStatus(value),
+    validate: (value) => (value ? "" : "Status must be one of: lead, active, pending, inactive.")
+  }
+];
+
+const INSURANCE_POLICY_FIELDS = [
+  { key: "policyNumber", label: "Policy Number", aliases: ["policy number", "policy no", "policynumber"], required: true },
+  { key: "policyType", label: "Policy Type", aliases: ["policy type"], required: true },
+  { key: "insuranceProvider", label: "Insurance Provider", aliases: ["insurance provider", "provider", "carrier"], required: true },
+  { key: "customerId", label: "Customer ID", aliases: ["customer id", "customerid"], required: true },
+  {
+    key: "policyStartDate",
+    label: "Policy Start Date",
+    aliases: ["policy start date", "start date", "policy start"],
+    required: true,
+    normalize: (value) => toIsoDateString(value),
+    validate: (value) => (value ? "" : "Policy Start Date is invalid.")
+  },
+  {
+    key: "policyEndDate",
+    label: "Policy End Date",
+    aliases: ["policy end date", "end date", "policy end"],
+    required: true,
+    normalize: (value) => toIsoDateString(value),
+    validate: (value) => (value ? "" : "Policy End Date is invalid.")
+  },
+  {
+    key: "coverageAmount",
+    label: "Coverage Amount",
+    aliases: ["coverage amount", "coverage"],
+    required: true,
+    normalize: (value) => toNonNegativeNumber(value),
+    validate: (value) => (Number.isFinite(value) ? "" : "Coverage Amount must be a non-negative number.")
+  },
+  {
+    key: "deductibleAmount",
+    label: "Deductible Amount",
+    aliases: ["deductible amount", "deductible"],
+    required: true,
+    normalize: (value) => toNonNegativeNumber(value),
+    validate: (value) => (Number.isFinite(value) ? "" : "Deductible Amount must be a non-negative number.")
+  },
+  {
+    key: "premiumAmount",
+    label: "Premium Amount",
+    aliases: ["premium amount", "premium"],
+    required: true,
+    normalize: (value) => toNonNegativeNumber(value),
+    validate: (value) => (Number.isFinite(value) ? "" : "Premium Amount must be a non-negative number.")
+  },
+  {
+    key: "paymentFrequency",
+    label: "Payment Frequency",
+    aliases: ["payment frequency", "frequency"],
+    required: true,
+    normalize: (value) => normalizePolicyPaymentFrequency(value),
+    validate: (value) => (value ? "" : "Payment Frequency must be monthly or yearly.")
+  },
+  {
+    key: "policyStatus",
+    label: "Policy Status",
+    aliases: ["policy status", "status"],
+    required: true,
+    normalize: (value) => normalizePolicyStatus(value),
+    validate: (value) => (value ? "" : "Policy Status must be one of: active, cancelled, expired, pending.")
+  }
+];
+
+const escapeRegex = (value = "") => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const encodePendingState = (prefix, draft = {}) => {
   try {
     const encoded = Buffer.from(JSON.stringify(draft), "utf8").toString("base64");
-    return `${INSURANCE_CLIENT_PENDING_PREFIX}${encoded}`;
+    return `${prefix}${encoded}`;
   } catch {
-    return INSURANCE_CLIENT_PENDING_PREFIX;
+    return prefix;
+  }
+};
+
+const decodePendingState = (prefix, pendingAction = "") => {
+  const raw = String(pendingAction || "");
+  if (!raw.startsWith(prefix)) return null;
+
+  const encoded = raw.slice(prefix.length);
+  if (!encoded) return { data: {} };
+
+  try {
+    return JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
+  } catch {
+    return { data: {} };
   }
 };
 
 const decodeInsuranceClientPendingState = (pendingAction = "") => {
-  const raw = String(pendingAction || "");
-  if (!raw.startsWith(INSURANCE_CLIENT_PENDING_PREFIX)) return null;
-
-  const encoded = raw.slice(INSURANCE_CLIENT_PENDING_PREFIX.length);
-  if (!encoded) return { step: 0, data: {} };
-
-  try {
-    const parsed = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
-    const step = Number(parsed?.step);
-    return {
-      step: Number.isInteger(step) && step >= 0 ? step : 0,
-      data: parsed?.data && typeof parsed.data === "object" ? parsed.data : {}
-    };
-  } catch {
-    return { step: 0, data: {} };
+  const parsed = decodePendingState(INSURANCE_CLIENT_PENDING_PREFIX, pendingAction);
+  if (!parsed) return null;
+  if (Number.isInteger(parsed?.step)) {
+    return { data: parsed?.data && typeof parsed.data === "object" ? parsed.data : {} };
   }
+  return { data: parsed?.data && typeof parsed.data === "object" ? parsed.data : {} };
+};
+
+const decodeInsurancePolicyPendingState = (pendingAction = "") => {
+  const parsed = decodePendingState(INSURANCE_POLICY_PENDING_PREFIX, pendingAction);
+  if (!parsed) return null;
+  return { data: parsed?.data && typeof parsed.data === "object" ? parsed.data : {} };
 };
 
 const extractInsuranceClientNameFromRequest = (rawText = "") => {
@@ -89,33 +224,125 @@ const extractInsuranceClientNameFromRequest = (rawText = "") => {
   return "";
 };
 
-const normalizeInsuranceClientStatus = (value = "") => {
-  const normalized = String(value || "").trim().toLowerCase();
-  if (INSURANCE_CLIENT_STATUSES.includes(normalized)) return normalized;
-  return "";
+const parseStructuredFields = (rawText = "", fieldDefs = []) => {
+  const text = String(rawText || "").trim();
+  if (!text) return {};
+
+  const parsed = {};
+  for (const def of fieldDefs) {
+    const aliases = Array.isArray(def.aliases) ? def.aliases : [def.label];
+    for (const alias of aliases) {
+      const pattern = new RegExp(`${escapeRegex(alias)}\\s*[:=-]\\s*([^\\n\\r,;]+)`, "i");
+      const match = text.match(pattern);
+      if (match?.[1]) {
+        parsed[def.key] = match[1].trim();
+        break;
+      }
+    }
+  }
+
+  return parsed;
 };
 
-const buildInsuranceClientStepPrompt = (draft = {}) => {
-  const step = Number(draft.step || 0);
+const evaluateFieldCollection = (fieldDefs = [], sourceData = {}) => {
+  const normalizedData = {};
+  const missingKeys = [];
+  const invalidFields = [];
 
-  if (step <= 0) {
-    return "Add insurance client started. Please send Full Name. (Type cancel to stop)";
-  }
-  if (step === 1) {
-    return "Please send Phone Number.";
-  }
-  if (step === 2) {
-    return "Please send Email Address.";
-  }
-  if (step === 3) {
-    return "Please send Customer ID.";
-  }
-  if (step === 4) {
-    return "Please send Policy Type.";
+  for (const def of fieldDefs) {
+    const rawValue = sourceData?.[def.key];
+    const hasValue = rawValue !== undefined && rawValue !== null && String(rawValue).trim() !== "";
+
+    if (!hasValue) {
+      if (def.required) missingKeys.push(def.key);
+      continue;
+    }
+
+    const normalize = typeof def.normalize === "function" ? def.normalize : (value) => String(value).trim();
+    const normalizedValue = normalize(rawValue);
+    const normalizedHasValue =
+      normalizedValue !== undefined &&
+      normalizedValue !== null &&
+      !(typeof normalizedValue === "string" && normalizedValue.trim() === "") &&
+      !(typeof normalizedValue === "number" && Number.isNaN(normalizedValue));
+
+    if (!normalizedHasValue) {
+      invalidFields.push({ key: def.key, label: def.label, reason: `${def.label} is invalid.` });
+      continue;
+    }
+
+    if (typeof def.validate === "function") {
+      const errorMessage = def.validate(normalizedValue);
+      if (errorMessage) {
+        invalidFields.push({ key: def.key, label: def.label, reason: errorMessage });
+        continue;
+      }
+    }
+
+    normalizedData[def.key] = normalizedValue;
   }
 
-  return "Please send Status (lead / active / pending / inactive).";
+  return { normalizedData, missingKeys, invalidFields };
 };
+
+const getFieldLabelByKey = (fieldDefs = [], key = "") => fieldDefs.find((entry) => entry.key === key)?.label || key;
+
+const buildCollectionTemplateLines = (fieldDefs = [], keys = []) => {
+  const targets = keys.length ? keys : fieldDefs.map((entry) => entry.key);
+  return targets.map((key) => `${getFieldLabelByKey(fieldDefs, key)}:`);
+};
+
+const buildMissingFieldsPrompt = (entityLabel, fieldDefs, missingKeys = [], invalidFields = []) => {
+  const lines = [`Add ${entityLabel} started.`];
+  if (invalidFields.length) {
+    lines.push("Please correct these fields:");
+    invalidFields.forEach((entry) => lines.push(`- ${entry.reason}`));
+  }
+  if (missingKeys.length) {
+    lines.push("Missing fields:");
+    missingKeys.forEach((key) => lines.push(`- ${getFieldLabelByKey(fieldDefs, key)}`));
+  }
+  lines.push("Send all missing fields in one message using this format:");
+  lines.push(...buildCollectionTemplateLines(fieldDefs, missingKeys));
+  lines.push("Type cancel to stop.");
+  return lines.join("\n");
+};
+
+const buildOnboardingReply = (body = "") => String(body || "").trim();
+
+const mergeStructuredFields = (rawUserText = "", fieldDefs = [], existingData = {}) => {
+  const parsedFromText = parseStructuredFields(rawUserText, fieldDefs);
+  return { ...existingData, ...parsedFromText };
+};
+
+const buildInsuranceClientConfirmation = (profile, created) =>
+  [
+    created ? "Insurance client added successfully." : "Insurance client updated successfully.",
+    `Name: ${profile.name || "-"}`,
+    `Phone: ${profile.phone || "-"}`,
+    `Email: ${profile.email || "-"}`,
+    `Customer ID: ${profile.insuranceData?.customerId || "-"}`,
+    `Policy Type: ${profile.insuranceData?.policyType || "-"}`,
+    `Status: ${profile.insuranceData?.status || "-"}`
+  ].join("\n");
+
+const buildInsurancePolicyConfirmation = (policy, created) =>
+  [
+    created ? "Policy information added successfully." : "Policy information updated successfully.",
+    `Policy Number: ${policy.policyNumber || "-"}`,
+    `Policy Type: ${policy.policyType || "-"}`,
+    `Provider: ${policy.insuranceProvider || "-"}`,
+    `Customer ID: ${policy.customerId || "-"}`,
+    `Start Date: ${policy.policyStartDate ? dayjs(policy.policyStartDate).format("YYYY-MM-DD") : "-"}`,
+    `End Date: ${policy.policyEndDate ? dayjs(policy.policyEndDate).format("YYYY-MM-DD") : "-"}`,
+    `Coverage Amount: ${Number(policy.coverageAmount || 0)}`,
+    `Deductible Amount: ${Number(policy.deductibleAmount || 0)}`,
+    `Premium Amount: ${Number(policy.premiumAmount || 0)}`,
+    `Payment Frequency: ${policy.paymentFrequency || "-"}`,
+    `Policy Status: ${policy.policyStatus || "-"}`
+  ].join("\n");
+
+const createPendingActionValue = (prefix, data = {}) => encodePendingState(prefix, { data });
 
 const saveInsuranceClientFromTelegram = async (payload = {}) => {
   const fullName = String(payload.fullName || "").trim();
@@ -172,106 +399,169 @@ const saveInsuranceClientFromTelegram = async (payload = {}) => {
   return { profile: existingProfile, created: false };
 };
 
-const startInsuranceClientOnboarding = (rawUserText, options = {}) => {
-  const extractedName = extractInsuranceClientNameFromRequest(rawUserText);
-  const data = extractedName ? { fullName: extractedName } : {};
-  const step = extractedName ? 1 : 0;
-  const prompt = buildInsuranceClientStepPrompt({ step, data });
+const saveInsurancePolicyFromTelegram = async (payload = {}) => {
+  const policyNumber = String(payload.policyNumber || "").trim();
+  if (!policyNumber) {
+    throw new Error("Policy Number is required");
+  }
 
-  const responseBody = extractedName
-    ? [
-      `Name captured: ${extractedName}`,
-      prompt
-    ].join("\n")
-    : prompt;
+  const existing = await InsurancePolicy.findOne({ policyNumber });
+  if (!existing) {
+    const created = await InsurancePolicy.create({
+      policyNumber,
+      policyType: payload.policyType,
+      insuranceProvider: payload.insuranceProvider,
+      customerId: payload.customerId,
+      policyStartDate: payload.policyStartDate,
+      policyEndDate: payload.policyEndDate,
+      coverageAmount: payload.coverageAmount,
+      deductibleAmount: payload.deductibleAmount,
+      premiumAmount: payload.premiumAmount,
+      paymentFrequency: payload.paymentFrequency,
+      policyStatus: payload.policyStatus
+    });
+    return { policy: created, created: true };
+  }
+
+  existing.policyType = payload.policyType;
+  existing.insuranceProvider = payload.insuranceProvider;
+  existing.customerId = payload.customerId;
+  existing.policyStartDate = payload.policyStartDate;
+  existing.policyEndDate = payload.policyEndDate;
+  existing.coverageAmount = payload.coverageAmount;
+  existing.deductibleAmount = payload.deductibleAmount;
+  existing.premiumAmount = payload.premiumAmount;
+  existing.paymentFrequency = payload.paymentFrequency;
+  existing.policyStatus = payload.policyStatus;
+  await existing.save();
+  return { policy: existing, created: false };
+};
+
+const startInsuranceClientOnboarding = async (rawUserText) => {
+  const extractedName = extractInsuranceClientNameFromRequest(rawUserText);
+  const merged = mergeStructuredFields(rawUserText, INSURANCE_CLIENT_FIELDS, extractedName ? { fullName: extractedName } : {});
+  const { normalizedData, missingKeys, invalidFields } = evaluateFieldCollection(INSURANCE_CLIENT_FIELDS, merged);
+
+  if (!missingKeys.length && !invalidFields.length) {
+    try {
+      const { profile, created } = await saveInsuranceClientFromTelegram(normalizedData);
+      return { reply: buildOnboardingReply(buildInsuranceClientConfirmation(profile, created)), pendingAction: "" };
+    } catch (error) {
+      return {
+        reply: buildOnboardingReply(`Could not save insurance client. Reason: ${error.message || "Unknown error"}`),
+        pendingAction: createPendingActionValue(INSURANCE_CLIENT_PENDING_PREFIX, normalizedData)
+      };
+    }
+  }
 
   return {
-    reply: buildChatReply(responseBody, options),
-    pendingAction: encodeInsuranceClientPendingState({ step, data })
+    reply: buildOnboardingReply(buildMissingFieldsPrompt("insurance client", INSURANCE_CLIENT_FIELDS, missingKeys, invalidFields)),
+    pendingAction: createPendingActionValue(INSURANCE_CLIENT_PENDING_PREFIX, normalizedData)
   };
 };
 
-const resolveInsuranceClientOnboardingTurn = async (rawUserText, priorDraft, options = {}) => {
-  const text = String(rawUserText || "").trim();
-  const draft = {
-    step: Number(priorDraft?.step || 0),
-    data: priorDraft?.data && typeof priorDraft.data === "object" ? { ...priorDraft.data } : {}
+const startInsurancePolicyOnboarding = async (rawUserText) => {
+  const merged = mergeStructuredFields(rawUserText, INSURANCE_POLICY_FIELDS, {});
+  const { normalizedData, missingKeys, invalidFields } = evaluateFieldCollection(INSURANCE_POLICY_FIELDS, merged);
+
+  if (!missingKeys.length && !invalidFields.length) {
+    try {
+      const { policy, created } = await saveInsurancePolicyFromTelegram(normalizedData);
+      return { reply: buildOnboardingReply(buildInsurancePolicyConfirmation(policy, created)), pendingAction: "" };
+    } catch (error) {
+      return {
+        reply: buildOnboardingReply(`Could not save policy information. Reason: ${error.message || "Unknown error"}`),
+        pendingAction: createPendingActionValue(INSURANCE_POLICY_PENDING_PREFIX, normalizedData)
+      };
+    }
+  }
+
+  return {
+    reply: buildOnboardingReply(buildMissingFieldsPrompt("policy information", INSURANCE_POLICY_FIELDS, missingKeys, invalidFields)),
+    pendingAction: createPendingActionValue(INSURANCE_POLICY_PENDING_PREFIX, normalizedData)
   };
+};
+
+const resolveInsuranceClientOnboardingTurn = async (rawUserText, priorDraft) => {
+  const text = String(rawUserText || "").trim();
+  const existingData = priorDraft?.data && typeof priorDraft.data === "object" ? priorDraft.data : {};
+  const currentlyMissing = evaluateFieldCollection(INSURANCE_CLIENT_FIELDS, existingData).missingKeys;
 
   if (!text) {
     return {
-      reply: buildChatReply("Please send a valid value.", options),
-      pendingAction: encodeInsuranceClientPendingState(draft)
+      reply: buildOnboardingReply("Please send a valid value."),
+      pendingAction: createPendingActionValue(INSURANCE_CLIENT_PENDING_PREFIX, existingData)
     };
   }
 
   if (isNegativeMessage(text)) {
+    return { reply: buildOnboardingReply("Insurance client add cancelled."), pendingAction: "" };
+  }
+
+  let merged = mergeStructuredFields(text, INSURANCE_CLIENT_FIELDS, existingData);
+  const parsedNow = parseStructuredFields(text, INSURANCE_CLIENT_FIELDS);
+  if (!Object.keys(parsedNow).length && currentlyMissing.length === 1) {
+    merged = { ...merged, [currentlyMissing[0]]: text };
+  }
+
+  const { normalizedData, missingKeys, invalidFields } = evaluateFieldCollection(INSURANCE_CLIENT_FIELDS, merged);
+  if (missingKeys.length || invalidFields.length) {
     return {
-      reply: buildChatReply("Insurance client add cancelled.", options),
-      pendingAction: ""
+      reply: buildOnboardingReply(buildMissingFieldsPrompt("insurance client", INSURANCE_CLIENT_FIELDS, missingKeys, invalidFields)),
+      pendingAction: createPendingActionValue(INSURANCE_CLIENT_PENDING_PREFIX, normalizedData)
     };
   }
 
-  if (draft.step <= 0) {
-    draft.data.fullName = text;
-    draft.step = 1;
-  } else if (draft.step === 1) {
-    draft.data.phone = text;
-    draft.step = 2;
-  } else if (draft.step === 2) {
-    if (!EMAIL_REGEX.test(text)) {
-      return {
-        reply: buildChatReply("Invalid email format. Please send a valid Email Address.", options),
-        pendingAction: encodeInsuranceClientPendingState(draft)
-      };
-    }
-    draft.data.email = text.toLowerCase();
-    draft.step = 3;
-  } else if (draft.step === 3) {
-    draft.data.customerId = text;
-    draft.step = 4;
-  } else if (draft.step === 4) {
-    draft.data.policyType = text;
-    draft.step = 5;
-  } else {
-    const status = normalizeInsuranceClientStatus(text);
-    if (!status) {
-      return {
-        reply: buildChatReply("Invalid status. Please send: lead / active / pending / inactive.", options),
-        pendingAction: encodeInsuranceClientPendingState(draft)
-      };
-    }
+  try {
+    const { profile, created } = await saveInsuranceClientFromTelegram(normalizedData);
+    return { reply: buildOnboardingReply(buildInsuranceClientConfirmation(profile, created)), pendingAction: "" };
+  } catch (error) {
+    return {
+      reply: buildOnboardingReply(`Could not save insurance client. Reason: ${error.message || "Unknown error"}`),
+      pendingAction: createPendingActionValue(INSURANCE_CLIENT_PENDING_PREFIX, normalizedData)
+    };
+  }
+};
 
-    draft.data.status = status;
+const resolveInsurancePolicyOnboardingTurn = async (rawUserText, priorDraft) => {
+  const text = String(rawUserText || "").trim();
+  const existingData = priorDraft?.data && typeof priorDraft.data === "object" ? priorDraft.data : {};
+  const currentlyMissing = evaluateFieldCollection(INSURANCE_POLICY_FIELDS, existingData).missingKeys;
 
-    try {
-      const { profile, created } = await saveInsuranceClientFromTelegram(draft.data);
-      const confirmation = [
-        created ? "Insurance client added successfully." : "Insurance client updated successfully.",
-        `Name: ${profile.name || "-"}`,
-        `Phone: ${profile.phone || "-"}`,
-        `Email: ${profile.email || "-"}`,
-        `Customer ID: ${profile.insuranceData?.customerId || "-"}`,
-        `Policy Type: ${profile.insuranceData?.policyType || "-"}`,
-        `Status: ${profile.insuranceData?.status || "-"}`
-      ].join("\n");
-
-      return {
-        reply: buildChatReply(confirmation, options),
-        pendingAction: ""
-      };
-    } catch (error) {
-      return {
-        reply: buildChatReply(`Could not save insurance client. Reason: ${error.message || "Unknown error"}`, options),
-        pendingAction: encodeInsuranceClientPendingState(draft)
-      };
-    }
+  if (!text) {
+    return {
+      reply: buildOnboardingReply("Please send a valid value."),
+      pendingAction: createPendingActionValue(INSURANCE_POLICY_PENDING_PREFIX, existingData)
+    };
   }
 
-  return {
-    reply: buildChatReply(buildInsuranceClientStepPrompt(draft), options),
-    pendingAction: encodeInsuranceClientPendingState(draft)
-  };
+  if (isNegativeMessage(text)) {
+    return { reply: buildOnboardingReply("Policy add cancelled."), pendingAction: "" };
+  }
+
+  let merged = mergeStructuredFields(text, INSURANCE_POLICY_FIELDS, existingData);
+  const parsedNow = parseStructuredFields(text, INSURANCE_POLICY_FIELDS);
+  if (!Object.keys(parsedNow).length && currentlyMissing.length === 1) {
+    merged = { ...merged, [currentlyMissing[0]]: text };
+  }
+
+  const { normalizedData, missingKeys, invalidFields } = evaluateFieldCollection(INSURANCE_POLICY_FIELDS, merged);
+  if (missingKeys.length || invalidFields.length) {
+    return {
+      reply: buildOnboardingReply(buildMissingFieldsPrompt("policy information", INSURANCE_POLICY_FIELDS, missingKeys, invalidFields)),
+      pendingAction: createPendingActionValue(INSURANCE_POLICY_PENDING_PREFIX, normalizedData)
+    };
+  }
+
+  try {
+    const { policy, created } = await saveInsurancePolicyFromTelegram(normalizedData);
+    return { reply: buildOnboardingReply(buildInsurancePolicyConfirmation(policy, created)), pendingAction: "" };
+  } catch (error) {
+    return {
+      reply: buildOnboardingReply(`Could not save policy information. Reason: ${error.message || "Unknown error"}`),
+      pendingAction: createPendingActionValue(INSURANCE_POLICY_PENDING_PREFIX, normalizedData)
+    };
+  }
 };
 
 const isAffirmativeMessage = (rawText) => {
@@ -392,7 +682,16 @@ const identifyIntent = (rawText) => {
     "new insurance client",
     "new client"
   ]);
+  const asksAddInsurancePolicy = includesAny(text, [
+    "add policy",
+    "create policy",
+    "save policy",
+    "policy information",
+    "add policy information",
+    "new policy"
+  ]);
   if (asksAddInsuranceClient) return "insurance_client_add";
+  if (asksAddInsurancePolicy) return "insurance_policy_add";
   if (mentionsClient && asksCount) return "insurance_clients_count";
   if (mentionsClient && asksList) return "insurance_clients_list";
   if (mentionsClient) return "insurance_clients_overview";
@@ -1036,7 +1335,8 @@ const buildHelpReply = (options = {}) =>
     "9) Show TikTok partner list.",
     "10) Show insurance client list.",
     "11) Add insurance client.",
-    "12) Give a full CRM summary.",
+    "12) Add policy information.",
+    "13) Give a full CRM summary.",
     "",
     "Quick commands: /appointments, /today, /fixed, /summary"
     ].join("\n")
@@ -1103,7 +1403,11 @@ const buildDeterministicReply = async (intent, snapshot, options = {}) => {
   }
 
   if (intent === "insurance_client_add") {
-    return startInsuranceClientOnboarding(options.userText, options);
+    return startInsuranceClientOnboarding(options.userText);
+  }
+
+  if (intent === "insurance_policy_add") {
+    return startInsurancePolicyOnboarding(options.userText);
   }
 
   if (intent === "interested_creators") {
@@ -1297,8 +1601,14 @@ const generateTelegramAssistantTurn = async (userText, options = {}) => {
 
   const insuranceClientDraft = decodeInsuranceClientPendingState(priorState.pendingAction);
   if (insuranceClientDraft) {
-    const onboardingTurn = await resolveInsuranceClientOnboardingTurn(trimmedUserText, insuranceClientDraft, options);
+    const onboardingTurn = await resolveInsuranceClientOnboardingTurn(trimmedUserText, insuranceClientDraft);
     return finalize(onboardingTurn.reply, "insurance_client_add", onboardingTurn.pendingAction || "");
+  }
+
+  const insurancePolicyDraft = decodeInsurancePolicyPendingState(priorState.pendingAction);
+  if (insurancePolicyDraft) {
+    const onboardingTurn = await resolveInsurancePolicyOnboardingTurn(trimmedUserText, insurancePolicyDraft);
+    return finalize(onboardingTurn.reply, "insurance_policy_add", onboardingTurn.pendingAction || "");
   }
 
   const snapshot = await buildMetricsSnapshot({ connectionKey: options.connectionKey });
