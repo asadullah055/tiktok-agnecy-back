@@ -29,6 +29,9 @@ const EMPTY_CONVERSATION_STATE = {
   lastAssistantText: "",
   updatedAt: null
 };
+const INSURANCE_CLIENT_PENDING_PREFIX = "insurance_client_add:";
+const INSURANCE_CLIENT_STATUSES = ["lead", "active", "pending", "inactive"];
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const sanitizeConversationState = (state = {}) => ({
   ...EMPTY_CONVERSATION_STATE,
@@ -38,6 +41,238 @@ const sanitizeConversationState = (state = {}) => ({
   lastAssistantText: String(state.lastAssistantText || "").trim(),
   updatedAt: state.updatedAt || null
 });
+
+const encodeInsuranceClientPendingState = (draft = {}) => {
+  try {
+    const encoded = Buffer.from(JSON.stringify(draft), "utf8").toString("base64");
+    return `${INSURANCE_CLIENT_PENDING_PREFIX}${encoded}`;
+  } catch {
+    return INSURANCE_CLIENT_PENDING_PREFIX;
+  }
+};
+
+const decodeInsuranceClientPendingState = (pendingAction = "") => {
+  const raw = String(pendingAction || "");
+  if (!raw.startsWith(INSURANCE_CLIENT_PENDING_PREFIX)) return null;
+
+  const encoded = raw.slice(INSURANCE_CLIENT_PENDING_PREFIX.length);
+  if (!encoded) return { step: 0, data: {} };
+
+  try {
+    const parsed = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
+    const step = Number(parsed?.step);
+    return {
+      step: Number.isInteger(step) && step >= 0 ? step : 0,
+      data: parsed?.data && typeof parsed.data === "object" ? parsed.data : {}
+    };
+  } catch {
+    return { step: 0, data: {} };
+  }
+};
+
+const extractInsuranceClientNameFromRequest = (rawText = "") => {
+  const text = String(rawText || "").trim();
+  if (!text) return "";
+
+  const explicitNameMatch = text.match(/\bname\s+(.+)$/i);
+  if (explicitNameMatch?.[1]) {
+    return explicitNameMatch[1].trim();
+  }
+
+  const inlineMatch = text.match(
+    /\b(?:add|create|save)\s+(?:new\s+)?(?:insurance\s+)?(?:client|customer)(?:\s+information)?\s+(.+)$/i
+  );
+  if (inlineMatch?.[1]) {
+    return inlineMatch[1].trim();
+  }
+
+  return "";
+};
+
+const normalizeInsuranceClientStatus = (value = "") => {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (INSURANCE_CLIENT_STATUSES.includes(normalized)) return normalized;
+  return "";
+};
+
+const buildInsuranceClientStepPrompt = (draft = {}) => {
+  const step = Number(draft.step || 0);
+
+  if (step <= 0) {
+    return "Add insurance client started. Please send Full Name. (Type cancel to stop)";
+  }
+  if (step === 1) {
+    return "Please send Phone Number.";
+  }
+  if (step === 2) {
+    return "Please send Email Address.";
+  }
+  if (step === 3) {
+    return "Please send Customer ID.";
+  }
+  if (step === 4) {
+    return "Please send Policy Type.";
+  }
+
+  return "Please send Status (lead / active / pending / inactive).";
+};
+
+const saveInsuranceClientFromTelegram = async (payload = {}) => {
+  const fullName = String(payload.fullName || "").trim();
+  if (!fullName) {
+    throw new Error("Full Name is required");
+  }
+
+  const phone = String(payload.phone || "").trim();
+  const email = String(payload.email || "").trim().toLowerCase();
+  const customerId = String(payload.customerId || "").trim();
+  const policyType = String(payload.policyType || "").trim();
+  const status = normalizeInsuranceClientStatus(payload.status) || "lead";
+
+  const identityFilters = [];
+  if (email) identityFilters.push({ email });
+  if (phone) identityFilters.push({ phone });
+
+  const existingProfile = identityFilters.length ? await Profile.findOne({ $or: identityFilters }) : null;
+
+  if (!existingProfile) {
+    const created = await Profile.create({
+      name: fullName,
+      phone,
+      email,
+      moduleMembership: ["insurance"],
+      insuranceData: {
+        customerId,
+        policyType,
+        status
+      }
+    });
+
+    return { profile: created, created: true };
+  }
+
+  if (!Array.isArray(existingProfile.moduleMembership)) {
+    existingProfile.moduleMembership = [];
+  }
+  if (!existingProfile.moduleMembership.includes("insurance")) {
+    existingProfile.moduleMembership.push("insurance");
+  }
+
+  existingProfile.name = fullName || existingProfile.name;
+  if (phone) existingProfile.phone = phone;
+  if (email) existingProfile.email = email;
+  existingProfile.insuranceData = {
+    ...(existingProfile.insuranceData?.toObject?.() || existingProfile.insuranceData || {}),
+    customerId: customerId || existingProfile.insuranceData?.customerId || "",
+    policyType: policyType || existingProfile.insuranceData?.policyType || "",
+    status: status || existingProfile.insuranceData?.status || "lead"
+  };
+  await existingProfile.save();
+
+  return { profile: existingProfile, created: false };
+};
+
+const startInsuranceClientOnboarding = (rawUserText, options = {}) => {
+  const extractedName = extractInsuranceClientNameFromRequest(rawUserText);
+  const data = extractedName ? { fullName: extractedName } : {};
+  const step = extractedName ? 1 : 0;
+  const prompt = buildInsuranceClientStepPrompt({ step, data });
+
+  const responseBody = extractedName
+    ? [
+      `Name captured: ${extractedName}`,
+      prompt
+    ].join("\n")
+    : prompt;
+
+  return {
+    reply: buildChatReply(responseBody, options),
+    pendingAction: encodeInsuranceClientPendingState({ step, data })
+  };
+};
+
+const resolveInsuranceClientOnboardingTurn = async (rawUserText, priorDraft, options = {}) => {
+  const text = String(rawUserText || "").trim();
+  const draft = {
+    step: Number(priorDraft?.step || 0),
+    data: priorDraft?.data && typeof priorDraft.data === "object" ? { ...priorDraft.data } : {}
+  };
+
+  if (!text) {
+    return {
+      reply: buildChatReply("Please send a valid value.", options),
+      pendingAction: encodeInsuranceClientPendingState(draft)
+    };
+  }
+
+  if (isNegativeMessage(text)) {
+    return {
+      reply: buildChatReply("Insurance client add cancelled.", options),
+      pendingAction: ""
+    };
+  }
+
+  if (draft.step <= 0) {
+    draft.data.fullName = text;
+    draft.step = 1;
+  } else if (draft.step === 1) {
+    draft.data.phone = text;
+    draft.step = 2;
+  } else if (draft.step === 2) {
+    if (!EMAIL_REGEX.test(text)) {
+      return {
+        reply: buildChatReply("Invalid email format. Please send a valid Email Address.", options),
+        pendingAction: encodeInsuranceClientPendingState(draft)
+      };
+    }
+    draft.data.email = text.toLowerCase();
+    draft.step = 3;
+  } else if (draft.step === 3) {
+    draft.data.customerId = text;
+    draft.step = 4;
+  } else if (draft.step === 4) {
+    draft.data.policyType = text;
+    draft.step = 5;
+  } else {
+    const status = normalizeInsuranceClientStatus(text);
+    if (!status) {
+      return {
+        reply: buildChatReply("Invalid status. Please send: lead / active / pending / inactive.", options),
+        pendingAction: encodeInsuranceClientPendingState(draft)
+      };
+    }
+
+    draft.data.status = status;
+
+    try {
+      const { profile, created } = await saveInsuranceClientFromTelegram(draft.data);
+      const confirmation = [
+        created ? "Insurance client added successfully." : "Insurance client updated successfully.",
+        `Name: ${profile.name || "-"}`,
+        `Phone: ${profile.phone || "-"}`,
+        `Email: ${profile.email || "-"}`,
+        `Customer ID: ${profile.insuranceData?.customerId || "-"}`,
+        `Policy Type: ${profile.insuranceData?.policyType || "-"}`,
+        `Status: ${profile.insuranceData?.status || "-"}`
+      ].join("\n");
+
+      return {
+        reply: buildChatReply(confirmation, options),
+        pendingAction: ""
+      };
+    } catch (error) {
+      return {
+        reply: buildChatReply(`Could not save insurance client. Reason: ${error.message || "Unknown error"}`, options),
+        pendingAction: encodeInsuranceClientPendingState(draft)
+      };
+    }
+  }
+
+  return {
+    reply: buildChatReply(buildInsuranceClientStepPrompt(draft), options),
+    pendingAction: encodeInsuranceClientPendingState(draft)
+  };
+};
 
 const isAffirmativeMessage = (rawText) => {
   const text = normalizeText(rawText).replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
@@ -145,6 +380,19 @@ const identifyIntent = (rawText) => {
   if (mentionsPartner) return "tiktok_partners_overview";
 
   const mentionsClient = includesAny(text, ["insurance client", "insurance clients", "client", "clients"]);
+  const asksAddInsuranceClient = includesAny(text, [
+    "add insurance client",
+    "add insurance customer",
+    "add client",
+    "add customer",
+    "create insurance client",
+    "create client",
+    "save insurance client",
+    "save client",
+    "new insurance client",
+    "new client"
+  ]);
+  if (asksAddInsuranceClient) return "insurance_client_add";
   if (mentionsClient && asksCount) return "insurance_clients_count";
   if (mentionsClient && asksList) return "insurance_clients_list";
   if (mentionsClient) return "insurance_clients_overview";
@@ -787,7 +1035,8 @@ const buildHelpReply = (options = {}) =>
     "8) Show fixed expense list.",
     "9) Show TikTok partner list.",
     "10) Show insurance client list.",
-    "11) Give a full CRM summary.",
+    "11) Add insurance client.",
+    "12) Give a full CRM summary.",
     "",
     "Quick commands: /appointments, /today, /fixed, /summary"
     ].join("\n")
@@ -851,6 +1100,10 @@ const buildDeterministicReply = async (intent, snapshot, options = {}) => {
   if (intent === "insurance_clients_list" || intent === "insurance_clients_overview") {
     const clients = await getInsuranceClients(10);
     return { reply: buildChatReply(formatInsuranceClients(clients), options) };
+  }
+
+  if (intent === "insurance_client_add") {
+    return startInsuranceClientOnboarding(options.userText, options);
   }
 
   if (intent === "interested_creators") {
@@ -1042,6 +1295,12 @@ const generateTelegramAssistantTurn = async (userText, options = {}) => {
     return finalize(buildHelpReply(options), "help");
   }
 
+  const insuranceClientDraft = decodeInsuranceClientPendingState(priorState.pendingAction);
+  if (insuranceClientDraft) {
+    const onboardingTurn = await resolveInsuranceClientOnboardingTurn(trimmedUserText, insuranceClientDraft, options);
+    return finalize(onboardingTurn.reply, "insurance_client_add", onboardingTurn.pendingAction || "");
+  }
+
   const snapshot = await buildMetricsSnapshot({ connectionKey: options.connectionKey });
 
   if (priorState.pendingAction && isAffirmativeMessage(trimmedUserText)) {
@@ -1056,7 +1315,10 @@ const generateTelegramAssistantTurn = async (userText, options = {}) => {
   }
 
   const intent = identifyIntent(trimmedUserText);
-  const deterministic = await buildDeterministicReply(intent, snapshot, options);
+  const deterministic = await buildDeterministicReply(intent, snapshot, {
+    ...options,
+    userText: trimmedUserText
+  });
   if (deterministic?.reply) {
     return finalize(deterministic.reply, intent, deterministic.pendingAction || "");
   }
